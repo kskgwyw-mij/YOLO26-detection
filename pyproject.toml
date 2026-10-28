@@ -1,0 +1,15 @@
+[project]
+name = "yolo26-detection"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "geopandas>=1.2.0",
+    "numpy>=2.5.4",
+    "pillow>=13.0.0",
+    "pyogrio>=0.13.0",
+    "pyproj>=3.8.0",
+    "requests>=2.34.2",
+    "scipy>=1.18.1",
+    "shapely>=2.2.0",
+    "ultralytics>=8.4.191",
+]
