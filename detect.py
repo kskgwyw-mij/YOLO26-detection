@@ -25,6 +25,7 @@ from tiles import OUT, ROOT, load_rgb, windows
 GSD = 0.2                  # native DOP20 pixel size (m)
 ROADMASK_GSD = 1.0         # resolution of the saved road mask (m/px)
 OBB_WIN, OBB_OVERLAP = 1024, 200
+OBB_SCALES = (1.0, 0.5)    # x0.5 lets large facilities (running tracks, pitches) fit one window
 SEG_OVERLAP = 320
 VEHICLES = {"small vehicle", "large vehicle"}
 INTERSECTION_MERGE_M = 8
@@ -45,22 +46,26 @@ def obb_nms(xywhr, conf, cls, iou=0.3):
     return np.array(keep, int)
 
 
-def run_obb(model, img, conf):
-    h, w = img.shape[:2]
+def run_obb(model, img, conf, scales=OBB_SCALES):
     polys, xywhr, cf, cl = [], [], [], []
-    for r0 in windows(h, OBB_WIN, OBB_OVERLAP):
-        for c0 in windows(w, OBB_WIN, OBB_OVERLAP):
-            res = model.predict(img[r0:r0 + OBB_WIN, c0:c0 + OBB_WIN], imgsz=OBB_WIN,
-                                conf=conf, verbose=False)[0]
-            if res.obb is None or len(res.obb) == 0:
-                continue
-            off = np.array([c0, r0], np.float32)
-            polys.append(res.obb.xyxyxyxy.cpu().numpy() + off)
-            b = res.obb.xywhr.cpu().numpy().copy()
-            b[:, :2] += off
-            xywhr.append(b)
-            cf.append(res.obb.conf.cpu().numpy())
-            cl.append(res.obb.cls.cpu().numpy().astype(int))
+    for s in scales:
+        im = img if s == 1 else np.asarray(Image.fromarray(img).resize(
+            (int(img.shape[1] * s), int(img.shape[0] * s)), Image.LANCZOS))
+        h, w = im.shape[:2]
+        for r0 in windows(h, OBB_WIN, OBB_OVERLAP):
+            for c0 in windows(w, OBB_WIN, OBB_OVERLAP):
+                res = model.predict(im[r0:r0 + OBB_WIN, c0:c0 + OBB_WIN], imgsz=OBB_WIN,
+                                    conf=conf, verbose=False)[0]
+                if res.obb is None or len(res.obb) == 0:
+                    continue
+                off = np.array([c0, r0], np.float32)
+                polys.append((res.obb.xyxyxyxy.cpu().numpy() + off) / s)
+                b = res.obb.xywhr.cpu().numpy().copy()
+                b[:, :2] += off
+                b[:, :4] /= s
+                xywhr.append(b)
+                cf.append(res.obb.conf.cpu().numpy())
+                cl.append(res.obb.cls.cpu().numpy().astype(int))
     if not polys:
         return []
     polys, xywhr, cf, cl = map(np.concatenate, (polys, xywhr, cf, cl))
@@ -99,10 +104,9 @@ def run_seg(model, img, conf):
                     pts.append(((c0 + x) / ds.SCALE, (r0 + y) / ds.SCALE))
                     pconf.append(float(c))
     inter = merge_points(np.array(pts).reshape(-1, 2), np.array(pconf), INTERSECTION_MERGE_M / GSD)
-    f = int(round(ROADMASK_GSD / (GSD / ds.SCALE)))
-    mh, mw = sh // f, sw // f
-    coarse = mask[:mh * f, :mw * f].reshape(mh, f, mw, f).mean((1, 3))
-    return (coarse * 255).astype(np.uint8), inter
+    size = (int(round(w * GSD / ROADMASK_GSD)), int(round(h * GSD / ROADMASK_GSD)))
+    coarse = Image.fromarray(mask * 255).resize(size, Image.BOX)
+    return np.asarray(coarse), inter
 
 
 def merge_points(xy, conf, radius):
