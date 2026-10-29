@@ -4,7 +4,7 @@ Nothing georeferenced is written, so locate.py cannot read the answer.
 
 Outputs per tile in outputs/det/:
   <tile>.json          image size, gsd, DOTA OBB objects, predicted intersections
-  <tile>_roadmask.png  predicted road mask at ROADMASK_GSD m/px (0-255)
+  <tile>_roadmask.png  predicted road mask at ROADMASK_GSD m/px (0-255), U-Net by default
   <tile>_preview.jpg   overlay for a visual check
 
 Usage: uv run detect.py <tif-or-folder> [--seg runs/roads/weights/best.pt]
@@ -20,6 +20,7 @@ from ultralytics import YOLO
 from ultralytics.utils.metrics import batch_probiou
 
 import make_dataset as ds
+import roadseg
 from tiles import OUT, ROOT, load_rgb, windows
 
 GSD = 0.2                  # native DOP20 pixel size (m)
@@ -80,8 +81,12 @@ def run_obb(model, img, conf, scales=OBB_SCALES):
     return out
 
 
-def run_seg(model, img, conf):
-    """Road mask (union of road instances) and intersection centres for a tile."""
+def run_seg(model, img, conf, road_model=None):
+    """Road mask and intersection centres for a tile.
+
+    Streets come from the U-Net `road_model` when given, otherwise from the
+    union of YOLO26-seg road instances. Intersections always come from YOLO26-seg.
+    """
     h, w = img.shape[:2]
     sh, sw = int(h * ds.SCALE), int(w * ds.SCALE)
     small = np.asarray(Image.fromarray(img).resize((sw, sh), Image.LANCZOS))
@@ -104,6 +109,8 @@ def run_seg(model, img, conf):
                     pts.append(((c0 + x) / ds.SCALE, (r0 + y) / ds.SCALE))
                     pconf.append(float(c))
     inter = merge_points(np.array(pts).reshape(-1, 2), np.array(pconf), INTERSECTION_MERGE_M / GSD)
+    if road_model is not None:
+        mask = (roadseg.predict(road_model, small) > roadseg.THRESHOLD).astype(np.uint8)
     size = (int(round(w * GSD / ROADMASK_GSD)), int(round(h * GSD / ROADMASK_GSD)))
     coarse = Image.fromarray(mask * 255).resize(size, Image.BOX)
     return np.asarray(coarse), inter
@@ -139,6 +146,9 @@ def main():
     ap.add_argument("src", type=Path)
     ap.add_argument("--obb", default=str(ROOT / "weights" / "yolo26s-obb.pt"))
     ap.add_argument("--seg", default=str(ROOT / "runs" / "roads" / "weights" / "best.pt"))
+    ap.add_argument("--roads", choices=["unet", "yolo"], default="unet",
+                    help="street mask from the U-Net (default) or from YOLO26-seg road instances")
+    ap.add_argument("--unet", type=Path, default=roadseg.WEIGHTS)
     ap.add_argument("--obb-conf", type=float, default=0.3)
     ap.add_argument("--seg-conf", type=float, default=0.25)
     ap.add_argument("--out", type=Path, default=OUT / "det")
@@ -146,9 +156,10 @@ def main():
     tifs = sorted(a.src.glob("*.tif")) if a.src.is_dir() else [a.src]
     a.out.mkdir(parents=True, exist_ok=True)
     obb, seg = YOLO(a.obb), YOLO(a.seg)  # each model loaded once, reused for every tile
+    unet = roadseg.load(a.unet) if a.roads == "unet" else None
     for tif in tifs:
         img = load_rgb(tif)
-        roadmask, inter = run_seg(seg, img, a.seg_conf)
+        roadmask, inter = run_seg(seg, img, a.seg_conf, unet)
         det = {"image": tif.stem, "width": img.shape[1], "height": img.shape[0], "gsd": GSD,
                "roadmask_gsd": ROADMASK_GSD, "objects": run_obb(obb, img, a.obb_conf),
                "intersections": inter}
