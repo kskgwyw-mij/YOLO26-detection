@@ -1,0 +1,10 @@
+*.tif
+rosenheim_area/
+.venv/
+*.pt
+weights/
+runs/
+datasets/
+outputs/
+__pycache__/
+.DS_Store
