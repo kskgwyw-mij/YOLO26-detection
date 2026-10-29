@@ -3,7 +3,8 @@
 Reads only detect.py output (pixel space) and OSM. Never opens GeoTIFF tags.
 
   (a) road correlation: NCC of the predicted road mask against rasterized OSM
-      streets over the whole search area (FFT)
+      streets over the whole search area (FFT); the same for the railway mask
+      against OSM railways when the image has any
   (b) votes: every (detected, OSM) intersection pair and same-class DOTA
       facility pair votes for an image upper-left corner
   (c) combined map -> best / runner-up peak -> local 1 m refinement ->
@@ -32,6 +33,10 @@ RES = 2.0                 # coarse search grid (m/px)
 BLUR_M = 2.0              # tolerance for road-width / alignment differences
 VOTE_SIGMA_M = 3.0
 W_INTER, W_FAC = 0.5, 0.3  # weight of vote maps relative to road NCC (range ~[-1, 1])
+# Set a priori (no val tile has a railway): a straight track barely fixes the
+# position along itself, so rails count less than streets.
+W_RAIL = 0.5
+MIN_SIGNAL = 0.002        # mask coverage below this: the mask is treated as empty
 PEAK_SEPARATION_M = 100
 MATCH_RADIUS_M = 6
 REFINE_RADIUS_M = 30
@@ -42,10 +47,10 @@ MIN_SCORE = 0.25
 _raster_cache = {}
 
 
-def search_raster(roads, area, res):
-    key = (tuple(area), res, len(roads))
+def search_raster(lines, area, res, name):
+    key = (name, tuple(area), res, len(lines))
     if key not in _raster_cache:
-        _raster_cache[key] = gaussian_filter(rasterize_roads(roads, area, res), BLUR_M / res)
+        _raster_cache[key] = gaussian_filter(rasterize_roads(lines, area, res), BLUR_M / res)
     return _raster_cache[key]
 
 
@@ -118,32 +123,41 @@ def osm_for(area):
     name = "area_" + "_".join(str(int(v)) for v in area)
     gpkg = OUT / "osm" / f"{name}.gpkg"
     if not gpkg.exists():
-        roads, inter, fac = osm.build(osm.fetch(name, area))
-        for layer, gdf in (("roads", roads), ("intersections", inter), ("facilities", fac)):
-            gdf.to_file(gpkg, layer=layer)
+        osm.build_all(name, area)
     return osm.load_layers(name)
 
 
 def load_detections(det_path):
+    """Detection JSON, road mask and railway mask (None when detect.py wrote none)."""
     det = json.loads(Path(det_path).read_text())
-    mask_path = Path(det_path).with_name(f"{Path(det_path).stem}_roadmask.png")
-    mask = np.asarray(Image.open(mask_path), np.float32) / 255
-    return det, mask
+    read = lambda p: np.asarray(Image.open(p), np.float32) / 255 if p.exists() else None
+    stem = Path(det_path).stem
+    return (det, read(Path(det_path).with_name(f"{stem}_roadmask.png")),
+            read(Path(det_path).with_name(f"{stem}_railmask.png")))
 
 
-def locate(det, mask, area, layers):
-    roads, inter, fac = layers
-    gsd, mres = det["gsd"], det["roadmask_gsd"]
-    ext_e, ext_n = det["width"] * gsd, det["height"] * gsd
-
-    # (a) road NCC on the coarse grid
-    R = search_raster(roads, area, RES)
+def mask_ncc(lines, area, mask, mres, name):
+    """NCC of a predicted mask (at mres m/px) against rasterized OSM lines on the RES grid."""
+    R = search_raster(lines, area, RES, name)
     f = int(round(RES / mres))
     th, tw = mask.shape[0] // f, mask.shape[1] // f
     T = gaussian_filter(mask[:th * f, :tw * f].reshape(th, f, tw, f).mean((1, 3)), BLUR_M / RES)
-    road_signal = float(T.mean())
-    N = ncc_map(R, T) if road_signal > 0.002 else np.zeros(
-        (R.shape[0] - th + 1, R.shape[1] - tw + 1), np.float32)
+    signal = float(T.mean())
+    if signal <= MIN_SIGNAL or len(lines) == 0:
+        return np.zeros((R.shape[0] - th + 1, R.shape[1] - tw + 1), np.float32), signal
+    return ncc_map(R, T), signal
+
+
+def locate(det, mask, rail, area, layers):
+    roads, inter, fac, rails = layers
+    gsd, mres = det["gsd"], det["roadmask_gsd"]
+    ext_e, ext_n = det["width"] * gsd, det["height"] * gsd
+
+    # (a) road and railway NCC on the coarse grid
+    N, road_signal = mask_ncc(roads, area, mask, mres, "roads")
+    Nr, rail_signal = np.zeros_like(N), 0.0
+    if rail is not None:
+        Nr, rail_signal = mask_ncc(rails[rails.active], area, rail, mres, "rails")
 
     # (b) vote maps, offsets in metres from the image's upper-left corner (x east, y south)
     det_int = np.array([p["center_px"] for p in det["intersections"]]).reshape(-1, 2) * gsd
@@ -155,7 +169,7 @@ def locate(det, mask, area, layers):
     Vf = vote_map(N.shape, area, RES, det_fac, [osm.DOTA_WEIGHT[o["class"]] for o in objs],
                   osm_fac, fac.dota_class.to_numpy(), [o["class"] for o in objs])
 
-    C = N + W_INTER * Vi + W_FAC * Vf
+    C = N + W_RAIL * Nr + W_INTER * Vi + W_FAC * Vf
     pk = peaks(C, RES)
     if not pk:
         return {"status": "not localizable", "reason": "no peak"}
@@ -176,8 +190,10 @@ def locate(det, mask, area, layers):
     return {"status": status, "ul_e": round(e, 2), "ul_n": round(n, 2),
             "center_lat": round(lat, 6), "center_lon": round(lon, 6),
             "score": round(score, 3), "runner_up": round(float(second), 3), "margin": round(margin, 3),
-            "road_ncc": round(float(N[best]), 3), "inter_votes": round(float(Vi[best]), 3),
+            "road_ncc": round(float(N[best]), 3), "rail_ncc": round(float(Nr[best]), 3),
+            "inter_votes": round(float(Vi[best]), 3),
             "fac_votes": round(float(Vf[best]), 3), "road_signal": round(road_signal, 4),
+            "rail_signal": round(rail_signal, 4),
             "n_det_intersections": len(det_int), "matched_intersections": n_match,
             "intersection_rms_m": rms, "matched_facilities": n_fac,
             "error_estimate_m": round(rms / np.sqrt(n_match), 2) if n_match >= 2 else None}
@@ -239,8 +255,8 @@ def main():
     a = ap.parse_args()
     area = (tuple(float(v) for v in a.search.split(",")) if a.search
             else place_area(a.place) if a.place else osm.AREA)
-    det, mask = load_detections(a.det)
-    print(json.dumps({"image": det["image"], **locate(det, mask, area, osm_for(area))}, indent=1))
+    det, mask, rail = load_detections(a.det)
+    print(json.dumps({"image": det["image"], **locate(det, mask, rail, area, osm_for(area))}, indent=1))
 
 
 if __name__ == "__main__":

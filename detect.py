@@ -5,6 +5,7 @@ Nothing georeferenced is written, so locate.py cannot read the answer.
 Outputs per tile in outputs/det/:
   <tile>.json          image size, gsd, DOTA OBB objects, predicted intersections
   <tile>_roadmask.png  predicted road mask at ROADMASK_GSD m/px (0-255), U-Net by default
+  <tile>_railmask.png  predicted railway mask, same grid (U-Net only)
   <tile>_preview.jpg   overlay for a visual check
 
 Usage: uv run detect.py <tif-or-folder> [--seg runs/roads/weights/best.pt]
@@ -81,11 +82,12 @@ def run_obb(model, img, conf, scales=OBB_SCALES):
     return out
 
 
-def run_seg(model, img, conf, road_model=None):
-    """Road mask and intersection centres for a tile.
+def run_seg(model, img, conf, road_model=None, rail_model=None):
+    """Road mask, railway mask (None without `rail_model`) and intersection centres.
 
-    Streets come from the U-Net `road_model` when given, otherwise from the
-    union of YOLO26-seg road instances. Intersections always come from YOLO26-seg.
+    Streets come from channel 0 of the U-Net `road_model` when given, otherwise
+    from the union of YOLO26-seg road instances; railways from the "rail"
+    channel of `rail_model`. Intersections always come from YOLO26-seg.
     """
     h, w = img.shape[:2]
     sh, sw = int(h * ds.SCALE), int(w * ds.SCALE)
@@ -110,10 +112,14 @@ def run_seg(model, img, conf, road_model=None):
                     pconf.append(float(c))
     inter = merge_points(np.array(pts).reshape(-1, 2), np.array(pconf), INTERSECTION_MERGE_M / GSD)
     if road_model is not None:
-        mask = (roadseg.predict(road_model, small) > roadseg.THRESHOLD).astype(np.uint8)
+        mask = (roadseg.predict(road_model, small)[0] > roadseg.THRESHOLD).astype(np.uint8)
+    rail = None
+    if rail_model is not None:
+        prob = roadseg.predict(rail_model, small)[roadseg.CLASSES.index("rail")]
+        rail = (prob > roadseg.THRESHOLD).astype(np.uint8)
     size = (int(round(w * GSD / ROADMASK_GSD)), int(round(h * GSD / ROADMASK_GSD)))
-    coarse = Image.fromarray(mask * 255).resize(size, Image.BOX)
-    return np.asarray(coarse), inter
+    coarse = lambda m: np.asarray(Image.fromarray(m * 255).resize(size, Image.BOX))
+    return coarse(mask), None if rail is None else coarse(rail), inter
 
 
 def merge_points(xy, conf, radius):
@@ -125,12 +131,13 @@ def merge_points(xy, conf, radius):
     return [{"center_px": np.round(xy[i], 1).tolist(), "conf": round(float(conf[i]), 3)} for i in kept]
 
 
-def preview(img, det, roadmask, path):
+def preview(img, det, roadmask, railmask, path):
     s = 0.25
     im = Image.fromarray(img).resize((int(img.shape[1] * s), int(img.shape[0] * s)))
-    road = Image.fromarray(roadmask).resize(im.size)
-    red = Image.new("RGB", im.size, (255, 0, 0))
-    im = Image.composite(red, im, road.point(lambda v: int(v * 0.45)))
+    for m, color in ((roadmask, (255, 0, 0)), (railmask, (0, 90, 255))):
+        if m is not None:
+            a = Image.fromarray(m).resize(im.size).point(lambda v: int(v * 0.45))
+            im = Image.composite(Image.new("RGB", im.size, color), im, a)
     d = ImageDraw.Draw(im)
     for o in det["objects"]:
         color = (120, 120, 120) if not o["use_for_locate"] else (0, 255, 0)
@@ -148,7 +155,9 @@ def main():
     ap.add_argument("--seg", default=str(ROOT / "runs" / "roads" / "weights" / "best.pt"))
     ap.add_argument("--roads", choices=["unet", "yolo"], default="unet",
                     help="street mask from the U-Net (default) or from YOLO26-seg road instances")
-    ap.add_argument("--unet", type=Path, default=roadseg.WEIGHTS)
+    ap.add_argument("--unet", type=Path, default=roadseg.STREET_WEIGHTS, help="U-Net for streets")
+    ap.add_argument("--rail-unet", type=Path, default=roadseg.WEIGHTS,
+                    help="two-class U-Net for railways ('none' to skip)")
     ap.add_argument("--obb-conf", type=float, default=0.3)
     ap.add_argument("--seg-conf", type=float, default=0.25)
     ap.add_argument("--out", type=Path, default=OUT / "det")
@@ -157,19 +166,23 @@ def main():
     a.out.mkdir(parents=True, exist_ok=True)
     obb, seg = YOLO(a.obb), YOLO(a.seg)  # each model loaded once, reused for every tile
     unet = roadseg.load(a.unet) if a.roads == "unet" else None
+    rail_unet = None if str(a.rail_unet) == "none" else roadseg.load(a.rail_unet)
     for tif in tifs:
         img = load_rgb(tif)
-        roadmask, inter = run_seg(seg, img, a.seg_conf, unet)
+        roadmask, railmask, inter = run_seg(seg, img, a.seg_conf, unet, rail_unet)
         det = {"image": tif.stem, "width": img.shape[1], "height": img.shape[0], "gsd": GSD,
                "roadmask_gsd": ROADMASK_GSD, "objects": run_obb(obb, img, a.obb_conf),
                "intersections": inter}
         (a.out / f"{tif.stem}.json").write_text(json.dumps(det))
         Image.fromarray(roadmask).save(a.out / f"{tif.stem}_roadmask.png")
-        preview(img, det, roadmask, a.out / f"{tif.stem}_preview.jpg")
+        if railmask is not None:
+            Image.fromarray(railmask).save(a.out / f"{tif.stem}_railmask.png")
+        preview(img, det, roadmask, railmask, a.out / f"{tif.stem}_preview.jpg")
         counts = {}
         for o in det["objects"]:
             counts[o["class"]] = counts.get(o["class"], 0) + 1
-        print(f"{tif.stem}: road {roadmask.mean() / 2.55:.1f}%  intersections {len(inter)}  {counts}")
+        rail = f"  rail {railmask.mean() / 2.55:.2f}%" if railmask is not None else ""
+        print(f"{tif.stem}: road {roadmask.mean() / 2.55:.1f}%{rail}  intersections {len(inter)}  {counts}")
 
 
 if __name__ == "__main__":
