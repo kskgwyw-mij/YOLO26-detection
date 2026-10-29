@@ -7,6 +7,7 @@
 import argparse
 import csv
 import json
+from pathlib import Path
 
 import numpy as np
 from PIL import Image
@@ -17,6 +18,37 @@ from locate import load_detections, locate, rasterize_roads
 from tiles import OUT, splits, tile_origin, tile_path
 
 SUCCESS_M = 10
+STREET_GROUPS = {
+    "major": ["motorway", "trunk", "primary", "secondary", "tertiary", "motorway_link",
+              "trunk_link", "primary_link", "secondary_link", "tertiary_link"],
+    "residential": ["residential", "unclassified", "living_street"],
+    "service": ["service"],
+    "track": ["track"],
+}
+
+
+def street_quality(tiles, layers, det_dir, tol_m=3):
+    """Road-mask precision/recall vs OSM per street type (tol_m tolerance, 1 m grid)."""
+    from scipy.ndimage import binary_dilation
+    roads = layers[0]
+    gt_n, hit_n, pred_n, pred_ok = {k: 0 for k in STREET_GROUPS}, {k: 0 for k in STREET_GROUPS}, 0, 0
+    for tile in tiles:
+        e0, n0, _ = tile_origin(tile_path(tile))
+        area = (e0, n0 - 1000, e0 + 1000, n0)
+        pred = np.asarray(Image.open(det_dir / f"{tile}_roadmask.png")) > 127
+        near_pred = binary_dilation(pred, iterations=tol_m)
+        gt_all = rasterize_roads(roads, area, 1.0) > 0.5
+        pred_n += pred.sum()
+        pred_ok += (pred & binary_dilation(gt_all, iterations=tol_m)).sum()
+        for k, hw in STREET_GROUPS.items():
+            gt = rasterize_roads(roads[roads.highway.isin(hw)], area, 1.0) > 0.5
+            gt_n[k] += gt.sum()
+            hit_n[k] += (gt & near_pred).sum()
+    total = sum(gt_n.values())
+    print(f"street mask vs OSM ({tol_m} m tolerance): precision {pred_ok / max(pred_n, 1):.2f}  "
+          f"recall {sum(hit_n.values()) / max(total, 1):.2f}")
+    for k in STREET_GROUPS:
+        print(f"  {k:12s} {gt_n[k] / total:4.0%} of street px   recall {hit_n[k] / max(gt_n[k], 1):.2f}")
 
 
 def make_oracle(tile, layers, out_dir, degrade=False):
@@ -60,10 +92,15 @@ def main():
     ap.add_argument("--oracle", action="store_true")
     ap.add_argument("--degrade", action="store_true", help="oracle with simulated detector errors")
     ap.add_argument("--split", default="test")
+    ap.add_argument("--quality", action="store_true", help="street-mask precision/recall per street type")
+    ap.add_argument("--det-dir", type=Path, default=OUT / "det")
     a = ap.parse_args()
     layers = osm.load_layers()
+    if a.quality:
+        street_quality(splits()[a.split], layers, a.det_dir)
+        return
     mode = ("oracle_degraded" if a.degrade else "oracle") if a.oracle else "real"
-    det_dir = OUT / ("det" if mode == "real" else mode)
+    det_dir = a.det_dir if mode == "real" else OUT / mode
     rows = []
     for tile in splits()[a.split]:
         path = make_oracle(tile, layers, det_dir, a.degrade) if a.oracle else det_dir / f"{tile}.json"
