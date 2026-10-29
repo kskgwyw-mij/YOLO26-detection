@@ -30,7 +30,7 @@ _layers = None
 
 def _init():
     global _layers
-    roads, inter, _ = load_layers()
+    roads, inter = load_layers()[:2]
     roads = roads.copy()
     roads["geometry"] = [g.buffer(w / 2, cap_style="flat", join_style="round").simplify(0.3)
                          for g, w in zip(roads.geometry, roads.width_m)]

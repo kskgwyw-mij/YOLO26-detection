@@ -4,6 +4,8 @@ matching layers in EPSG:25832:
   roads          buffered-width street centrelines (LineString, highway, width_m)
   intersections  junction points where >= 3 street segments meet (degree)
   facilities     static objects mapped to DOTA class names (dota_class)
+  railways       track centrelines (LineString, railway, width_m, active); fetched
+                 with a separate query and cache so the street data stays unchanged
 
 Usage:
   uv run osm.py                      # fetch (cached) + build outputs/osm/rosenheim.gpkg
@@ -39,6 +41,9 @@ ROAD_WIDTH = {
 # Small or hidden service ways make noisy labels and spurious junctions.
 SKIP_SERVICE = {"parking_aisle", "driveway", "drive-through", "emergency_access"}
 JUNCTION_MERGE_M = 8
+# Each track is its own OSM way; width covers sleepers + ballast of one track.
+RAIL_WIDTH = {"rail": 4, "light_rail": 3.5, "narrow_gauge": 3}
+RAIL_INACTIVE = {"abandoned", "disused"}  # may or may not still be visible: ignored in training
 
 # DOTA class -> weight for voting (rarity x OSM completeness). Vehicles are never used.
 DOTA_WEIGHT = {
@@ -73,15 +78,23 @@ def query(area):
 out body geom;"""
 
 
-def fetch(name="rosenheim", area=AREA, refresh=False):
-    cache = OUT / "osm" / f"{name}_raw.json"
+def rail_query(area):
+    s, w, n, e = to_wgs84_bbox(area)
+    kinds = "|".join([*RAIL_WIDTH, *RAIL_INACTIVE])
+    return f"""[out:json][timeout:300];
+way["railway"~"^({kinds})$"]({s:.6f},{w:.6f},{n:.6f},{e:.6f});
+out body geom;"""
+
+
+def fetch(name="rosenheim", area=AREA, refresh=False, kind="raw", make_query=query):
+    cache = OUT / "osm" / f"{name}_{kind}.json"
     if cache.exists() and not refresh:
         return json.loads(cache.read_text())
     cache.parent.mkdir(parents=True, exist_ok=True)
     for attempt in range(3):
         for url in OVERPASS_URLS:
             try:
-                r = requests.post(url, data={"data": query(area)},
+                r = requests.post(url, data={"data": make_query(area)},
                                   headers={"User-Agent": USER_AGENT}, timeout=360)
                 r.raise_for_status()
                 data = r.json()
@@ -186,6 +199,33 @@ def build(raw):
     return to_gdf(roads), to_gdf(inter), to_gdf(facilities)
 
 
+def build_rails(raw):
+    proj = Transformer.from_crs("EPSG:4326", CRS, always_xy=True).transform
+    rows = []
+    for el in raw["elements"]:
+        tags = el.get("tags", {})
+        kind = tags.get("railway")
+        if el["type"] != "way" or kind not in RAIL_WIDTH.keys() | RAIL_INACTIVE:
+            continue
+        if tags.get("tunnel", "no") != "no" or len(el.get("geometry", [])) < 2:
+            continue
+        rows.append({"geometry": LineString([proj(p["lon"], p["lat"]) for p in el["geometry"]]),
+                     "osm_id": el["id"], "railway": kind,
+                     "width_m": RAIL_WIDTH.get(kind, 4), "active": kind in RAIL_WIDTH})
+    return gpd.GeoDataFrame(rows, geometry="geometry", crs=CRS)
+
+
+def build_all(name="rosenheim", area=AREA, refresh=False):
+    """Fetch (cached) and write all four layers to outputs/osm/<name>.gpkg."""
+    roads, inter, fac = build(fetch(name, area, refresh))
+    rails = build_rails(fetch(name, area, refresh, "rail", rail_query))
+    gpkg = OUT / "osm" / f"{name}.gpkg"
+    gpkg.unlink(missing_ok=True)
+    for layer, gdf in zip(LAYERS, (roads, inter, fac, rails)):
+        gdf.to_file(gpkg, layer=layer)
+    return roads, inter, fac, rails
+
+
 def _roundabouts(node_sets, node_xy):
     """Roundabouts are often split into several ways; merge ways sharing nodes."""
     groups = []
@@ -221,15 +261,18 @@ def _intersections(neighbours, node_xy):
     return out
 
 
+LAYERS = ("roads", "intersections", "facilities", "railways")
+
+
 def load_layers(name="rosenheim"):
     gpkg = OUT / "osm" / f"{name}.gpkg"
-    return tuple(gpd.read_file(gpkg, layer=l) for l in ("roads", "intersections", "facilities"))
+    return tuple(gpd.read_file(gpkg, layer=l) for l in LAYERS)
 
 
 def overlay(tile, crops=((1000, 2200), (2600, 3600), (300, 300)), size=1500):
     """Gate A: draw OSM road polygons + intersection disks over full-res crops."""
     from PIL import Image, ImageDraw
-    roads, inter, fac = load_layers()
+    roads, inter, fac, rails = load_layers()
     e0, n0, gsd = tile_origin(tile_path(tile))
     img = load_rgb(tile_path(tile))
     to_px = lambda coords: [((x - e0) / gsd, (n0 - y) / gsd) for x, y in coords]
@@ -241,6 +284,11 @@ def overlay(tile, crops=((1000, 2200), (2600, 3600), (300, 300)), size=1500):
         for p in getattr(poly, "geoms", [poly]):
             d.polygon(to_px(p.exterior.coords), fill=(255, 0, 0, 70), outline=(255, 0, 0, 200))
         d.line(to_px(r.geometry.coords), fill=(255, 255, 0, 255), width=2)
+    for _, r in rails.iterrows():
+        poly = r.geometry.buffer(r.width_m / 2, cap_style="flat")
+        color = (0, 120, 255) if r.active else (255, 0, 255)
+        for p in getattr(poly, "geoms", [poly]):
+            d.polygon(to_px(p.exterior.coords), fill=(*color, 70), outline=(*color, 220))
     for _, r in inter.iterrows():
         x, y = to_px(r.geometry.coords)[0]
         rad = 8 / gsd
@@ -267,17 +315,12 @@ def main():
     if a.overlay:
         print(overlay(a.overlay))
         return
-    raw = fetch(refresh=a.refresh)
-    roads, inter, fac = build(raw)
-    gpkg = OUT / "osm" / "rosenheim.gpkg"
-    gpkg.unlink(missing_ok=True)
-    roads.to_file(gpkg, layer="roads")
-    inter.to_file(gpkg, layer="intersections")
-    fac.to_file(gpkg, layer="facilities")
+    roads, inter, fac, rails = build_all(refresh=a.refresh)
     print(f"bbox S,W,N,E = {tuple(round(v, 5) for v in to_wgs84_bbox(AREA))}")
     print(f"roads {len(roads)}  ({roads.length.sum() / 1000:.0f} km)")
     print(f"intersections {len(inter)}  degree: {inter.degree.value_counts().sort_index().to_dict()}")
     print(f"facilities: {fac.dota_class.value_counts().to_dict()}")
+    print(f"railways: {rails.length.groupby(rails.railway).sum().div(1000).round(1).to_dict()} km")
 
 
 if __name__ == "__main__":

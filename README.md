@@ -4,10 +4,11 @@ Proof of Concept: locate aerial images from their content alone, by matching YOL
 ## Idea
 1. **Detect** in the image (pixel space, no georeference):
    - streets: U-Net (ResNet34 encoder, ImageNet-pretrained) trained on road masks rasterized from OSM (`roadseg.py`). It replaced the YOLO26-seg road instances, which broke up long roads and missed dual carriageways.
+   - railways: a second U-Net with two output channels (street, railway), trained on OSM railways (`railway=rail|light_rail|narrow_gauge`, no tunnels; abandoned/disused lines ignored in the loss). Only its railway channel is used (see results).
    - intersections: `yolo26s-seg` fine-tuned on labels generated automatically from OSM
    - sports facilities, roundabouts, bridges, tanks: pretrained `yolo26s-obb` (DOTA-v1); vehicles are detected but never used for locating
 2. **Fetch** the same features from OSM via the Overpass API for a coarse search area.
-3. **Locate**: correlate the predicted road mask with the rasterized OSM street network (FFT), add votes from intersection and facility pairs, refine at 1 m, then least-squares on matched intersections. Ambiguous results are reported as *not localizable* instead of guessed.
+3. **Locate**: correlate the predicted road mask with the rasterized OSM street network (FFT), plus the railway mask with OSM railways (weight `W_RAIL = 0.5`, set a priori) when the image has any, add votes from intersection and facility pairs, refine at 1 m, then least-squares on matched intersections. Ambiguous results are reported as *not localizable* instead of guessed.
 
 ## Assumptions for an image to locate
 - nadir orthophoto, **north-up**, **known pixel size** (default 0.2 m, Bavarian DOP20)
@@ -29,14 +30,16 @@ uv run osm.py --overlay 32732_5306     # check OSM vs. image alignment
 uv run make_dataset.py                 # OSM-labelled YOLO-seg dataset (train/val tiles only)
 uv run train.py --smoke                # 1-epoch pipeline check
 uv run train.py                        # full fine-tuning on MPS (hours)
-uv run roadseg.py masks                # OSM road masks for the same windows
-uv run roadseg.py train                # U-Net street segmenter, 30 epochs on MPS (~1.7 h)
-uv run detect.py rosenheim_area/       # all models -> outputs/det/<tile>.json + _roadmask.png  [--roads yolo]
+uv run roadseg.py masks                # OSM street + railway masks for the same windows
+uv run roadseg.py train                # two-class U-Net, 30 epochs on MPS (~1.7 h) -> runs/roadseg/best.pt
+uv run detect.py rosenheim_area/       # all models -> outputs/det/<tile>.json + _roadmask.png + _railmask.png
 uv run locate.py outputs/det/32732_5306.json [--search minE,minN,maxE,maxN | --place Rosenheim]
 uv run evaluate.py --oracle [--degrade]  # locator check with OSM-made (degraded) detections
 uv run evaluate.py                     # real detections, test split
 uv run evaluate.py --quality           # street-mask precision/recall vs OSM per street type
 ```
+
+The streets-only U-Net (`runs/roadseg_streets/best.pt`) is trained from commit `f66b7e2`: there, run `uv run roadseg.py masks` and `uv run roadseg.py train`, and move `runs/roadseg/best.pt` to `runs/roadseg_streets/best.pt`. Back on the current commit, rerun `uv run roadseg.py masks`, because the mask format changed. The current `roadseg.py` trains the two-class model: it holds out `32734_5304` as railway validation (no val tile has a railway) and uses batch-level Dice. `detect.py --rail-unet none` skips railways; `--roads yolo` takes streets from YOLO26-seg.
 
 `locate.py` reads only detector output and OSM; true positions (GeoTIFF tags) are used only in `make_dataset.py` and `evaluate.py`.
 
@@ -44,13 +47,34 @@ uv run evaluate.py --quality           # street-mask precision/recall vs OSM per
 | Run | Test tiles within 10 m | Median error |
 |---|---|---|
 | Oracle (perfect detections) | 12/12 | 0.0 m |
-| Degraded oracle (40 % streets/intersections dropped, 2 m jitter, 30 % false intersections) | 12/12 | 0.6 m |
+| Degraded oracle (40 % streets/railways/intersections dropped, 2 m jitter, 30 % false intersections) | 12/12 | 0.52 m (0.6 m before railways; the noise draws changed, so not directly comparable) |
 | Real, YOLO26-seg streets, test (12 tiles) | 11/12, 1 not localizable, 0 wrong | 0.74 m (max 1.26 m) |
 | Real, YOLO26-seg streets, val (6 tiles) | 4/6, 2 not localizable, 0 wrong | 0.53 m |
-| **Real, U-Net streets, test (12 tiles)** | **12/12**, 0 wrong | **0.65 m** (max 1.34 m) |
-| **Real, U-Net streets, val (6 tiles)** | **6/6**, 0 wrong | **0.34 m** (max 1.49 m) |
+| Real, U-Net streets, test (12 tiles) | 12/12, 0 wrong | 0.65 m (max 1.34 m) |
+| Real, U-Net streets, val (6 tiles) | 6/6, 0 wrong | 0.34 m (max 1.49 m) |
+| Real, two-class U-Net (streets + railways), test | 12/12, 0 wrong | 0.64 m |
+| Real, two-class U-Net (streets + railways), val | 5/6, 1 not localizable, 0 wrong | 0.14 m |
+| **Real, streets U-Net + railways from two-class U-Net, test** | **12/12**, 0 wrong | **0.65 m** (max 1.34 m) |
+| **Real, streets U-Net + railways from two-class U-Net, val** | **6/6**, 0 wrong | **0.34 m** (max 1.49 m) |
 
 Search area for all runs: the 54-tile extent + 1 km (9 × 12 km, about 108 km²). With YOLO streets, the tiles that couldn't be localized were rural, with < 1 % road pixels and few intersections. In one of them (32729_5301) the best peak was 3.9 km off, and the margin rule rejected it. With U-Net streets all three are located correctly. The val tiles also chose the U-Net checkpoint (best val IoU), so the val numbers are slightly optimistic; test is clean.
+
+Railways (default setup, last two rows): the error is unchanged, because streets already fix the position. Railways raise the confidence margin on the 6 test tiles where track is detected, and change nothing elsewhere:
+
+| Test tile | Margin, streets only | Margin, + railways | Railway recall |
+|---|---|---|---|
+| 32731_5306 | 0.49 | 0.68 | 1.00 |
+| 32731_5307 | 0.66 | 0.96 | 0.85 |
+| 32731_5308 | 0.28 | 0.61 | 0.84 |
+| 32732_5305 | 0.97 | 1.06 | 0.97 |
+| 32732_5306 | 0.74 | 0.89 | 0.76 |
+| 32732_5307 | 0.89 | 1.11 | 0.71 |
+| 32732_5308 | 0.71 | 0.71 | 0.20 |
+
+- Railway mask on the test tiles: precision 0.99, recall 0.81 (3 m tolerance). No railway pixels at all on the val tiles, which have no track.
+- 32732_5308 has a single overgrown branch-line track next to a road. The training data is mostly the double-track main line and the station, so this line is barely detected and contributes nothing.
+- A straight track barely fixes the position along itself, so railways add evidence on top of streets; they are not a standalone locator.
+- Why streets still come from the streets-only U-Net: in this one training run, the street channel of the two-class model was slightly weaker on the val tiles (IoU 0.617 vs 0.633 on the 6 original val tiles; track recall 0.52 vs 0.60). With it, val tile 32729_5301 is placed correctly (0.21 m) but its margin drops from 0.082 to 0.043, below the threshold. A 0.016 IoU gap is within plausible run-to-run noise; this is not evidence that training railways hurts streets. The choice was made on val; the two-class test numbers had already been seen.
 
 Street mask vs OSM on the 12 test tiles (3 m tolerance):
 
@@ -71,5 +95,5 @@ Detector quality on test tile 32732_5306, measured against OSM:
   - The facility vote uses a fixed 3 m sigma. For large objects this is probably too tight (not yet measured).
 
 Caveats:
-- the confidence threshold (`MIN_MARGIN = 0.05`) was set a priori. With YOLO streets, margins of correct results ranged from 0.09 to 0.76, and those of rejected results from 0.002 to 0.04. With U-Net streets, correct margins are 0.28–0.97 on test and 0.08–1.04 on val; the weakest (32729_5301, 0.08) is close to the threshold.
+- the confidence threshold (`MIN_MARGIN = 0.05`) was set a priori. With YOLO streets, margins of correct results ranged from 0.09 to 0.76, and those of rejected results from 0.002 to 0.04. With the default setup, correct margins are 0.61–1.11 on test and 0.08–1.04 on val. The weakest (val tile 32729_5301, rural, 0/1 intersections matched) is fragile: one U-Net retrain moved it from 0.082 to 0.043, below the threshold, while its position stayed correct. Rural tiles need more landmarks (tree rows, hedges, forest edges are next).
 - larger search areas will lower the margins; they have not been tested yet.
