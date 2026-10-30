@@ -43,6 +43,12 @@ uv run evaluate.py --quality           # street-mask precision/recall vs OSM per
 
 The streets-only U-Net (`runs/roadseg_streets/best.pt`) is trained from commit `f66b7e2`: there, run `uv run roadseg.py masks` and `uv run roadseg.py train`, and move `runs/roadseg/best.pt` to `runs/roadseg_streets/best.pt`. Back on the current commit, rerun `uv run roadseg.py masks`, because the mask format changed. The current `roadseg.py` trains the two-class model: it holds out `32734_5304` as railway validation (no val tile has a railway) and uses batch-level Dice. `detect.py --rail-unet none` / `--forest-unet none` skip railways / forest; `--roads yolo` takes streets from YOLO26-seg.
 
+### Web app
+```
+uv run streamlit run app.py            # http://localhost:8501
+```
+Upload an aerial image (GeoTIFF, PNG, JPG), or pick a train/val/test tile, set the pixel size (resampled to 0.2 m for the models) and the search area, then press *Locate*. The app shows the detections, OSM drawn at the located position, a map with the located footprint, and margin, score and per-signal details. When the file has GeoTIFF tags, they are read only after locating, to show the true footprint, the error and the split. Results on train tiles are optimistic, and on val tiles slightly so. The full models take about 40 s per tile on the M3. For test and val tiles, *Reuse saved detections* takes them from `outputs/det` instead.
+
 `locate.py` reads only detector output and OSM; true positions (GeoTIFF tags) are used only in `make_dataset.py` and `evaluate.py`.
 
 ## Results so far

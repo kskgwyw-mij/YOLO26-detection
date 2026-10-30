@@ -12,5 +12,6 @@ dependencies = [
     "scipy>=1.18.1",
     "segmentation-models-pytorch>=0.6.0",
     "shapely>=2.2.0",
+    "streamlit>=1.66.1",
     "ultralytics>=8.4.191",
 ]
