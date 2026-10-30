@@ -1,25 +1,30 @@
-"""Semantic street + railway segmentation (U-Net, ResNet34 encoder).
+"""Semantic street / railway / forest segmentation (U-Net, ResNet34 encoder).
 
 YOLO26-seg instance masks broke up long roads and missed dual carriageways,
 so streets come from this model; intersections still come from YOLO26-seg.
 Training images are the make_dataset.py windows (0.4 m/px, 640 px); masks are
-rasterized from the same OSM streets and railways that locate.py correlates against.
+rasterized from the same OSM layers that locate.py correlates against.
 
-Output channels are independent (sigmoid): 0 = street, 1 = railway. Abandoned
+A model is trained for a chosen subset of CLASSES (--classes); its output
+channels are independent sigmoids in that order, and the checkpoint stores
+the class names. Abandoned
 and disused lines are ignored in the railway loss. No val tile has a railway,
 so the windows of RAIL_VAL_TILES move from train to val here (U-Net only;
 splits.json and the YOLO models are unchanged).
 
 detect.py takes streets from STREET_WEIGHTS, a streets-only U-Net trained with
-this file at commit f66b7e2, and railways from WEIGHTS. In our one training run
-the street channel of the two-class model was slightly weaker on the val tiles.
+this file at commit f66b7e2, railways from WEIGHTS (road + rail) and forest from
+FOREST_WEIGHTS (forest only). In our one training run the street channel of the
+two-class model was slightly weaker on the val tiles.
 
 Usage:
   uv run roadseg.py masks            # write datasets/roads/masks/{train,val}
-  uv run roadseg.py train [--epochs 30]
+  uv run roadseg.py train [--epochs 30]                                   # road + rail
+  uv run roadseg.py train --classes forest --out runs/forestseg/best.pt   # forest
 """
 import argparse
 import time
+from pathlib import Path
 
 import numpy as np
 import segmentation_models_pytorch as smp
@@ -30,22 +35,23 @@ from PIL import Image
 
 import make_dataset as ds
 import osm
-from locate import rasterize_roads
+from locate import rasterize_areas, rasterize_roads
 from tiles import ROOT, tile_origin, tile_path, windows
 
 DATA = ROOT / "datasets" / "roads"
 WEIGHTS = ROOT / "runs" / "roadseg" / "best.pt"
 STREET_WEIGHTS = ROOT / "runs" / "roadseg_streets" / "best.pt"
+FOREST_WEIGHTS = ROOT / "runs" / "forestseg" / "best.pt"
 MEAN = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
 STD = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
 PRED_OVERLAP = 160
 THRESHOLD = 0.5
-CLASSES = ("road", "rail")
-ROAD, RAIL, RAIL_IGNORE = 1, 2, 4   # bits of the saved mask PNG
+CLASSES = ("road", "rail", "forest")
+ROAD, RAIL, RAIL_IGNORE, FOREST = 1, 2, 4, 8   # bits of the saved mask PNG
 RAIL_VAL_TILES = ("32734_5304",)
 
 
-def build_model(pretrained=True, n_classes=len(CLASSES)):
+def build_model(pretrained=True, n_classes=2):
     m = smp.Unet("resnet34", encoder_weights=None, classes=n_classes)
     if pretrained:  # ImageNet weights via torchvision (the HF hub is unreachable here)
         sd = torchvision.models.resnet34(weights="IMAGENET1K_V1").state_dict()
@@ -58,7 +64,7 @@ def device():
 
 
 def make_masks():
-    roads, _, _, rails = osm.load_layers()
+    roads, _, _, rails, forest = osm.load_layers()
     active, inactive = rails[rails.active], rails[~rails.active]
     res = ds.WIN * 0.2 / ds.IMGSZ
     origins = {}
@@ -76,23 +82,33 @@ def make_masks():
             area = (we, wn - span, we + span, wn)
             m = ((rasterize_roads(roads, area, res) > 0.5) * ROAD
                  | (rasterize_roads(active, area, res) > 0.5) * RAIL
-                 | (rasterize_roads(inactive, area, res) > 0.5) * RAIL_IGNORE)
+                 | (rasterize_roads(inactive, area, res) > 0.5) * RAIL_IGNORE
+                 | (rasterize_areas(forest, area, res) > 0.5) * FOREST)
             Image.fromarray(m.astype(np.uint8)).save(out / f"{img.stem}.png")
         print(split, len(list(out.glob("*.png"))))
 
 
-def image_list(split):
-    is_rail_val = lambda p: p.stem.rsplit("_", 2)[0] in RAIL_VAL_TILES
+def image_list(split, hold_rail_val=True):
+    is_rail_val = lambda p: hold_rail_val and p.stem.rsplit("_", 2)[0] in RAIL_VAL_TILES
     train = sorted((DATA / "images" / "train").glob("*.jpg"))
     if split == "train":
         return [p for p in train if not is_rail_val(p)]
     return sorted((DATA / "images" / "val").glob("*.jpg")) + [p for p in train if is_rail_val(p)]
 
 
+def targets(m, classes):
+    """Target and validity channels for `classes` from a bit-encoded mask (rail ignored on inactive lines)."""
+    bits = {"road": ROAD, "rail": RAIL, "forest": FOREST}
+    y = [m & bits[c] > 0 for c in classes]
+    valid = [(m & RAIL_IGNORE == 0) | (m & RAIL > 0) if c == "rail" else torch.ones_like(m, dtype=torch.bool)
+             for c in classes]
+    return torch.stack(y + valid).float()
+
+
 class RoadData(torch.utils.data.Dataset):
-    def __init__(self, split, augment):
-        self.imgs = image_list(split)
-        self.augment = augment
+    def __init__(self, split, augment, classes=("road", "rail")):
+        self.imgs = image_list(split, hold_rail_val="rail" in classes)
+        self.augment, self.classes = augment, classes
 
     def __len__(self):
         return len(self.imgs)
@@ -101,9 +117,7 @@ class RoadData(torch.utils.data.Dataset):
         p = self.imgs[i]
         x = torch.from_numpy(np.array(Image.open(p).convert("RGB"))).permute(2, 0, 1).float() / 255
         m = torch.from_numpy(np.array(Image.open(DATA / "masks" / p.parent.name / f"{p.stem}.png")))
-        # channels: road, rail targets, then their validity (rail ignored on inactive lines)
-        y = torch.stack([m & ROAD > 0, m & RAIL > 0, torch.ones_like(m, dtype=torch.bool),
-                         (m & RAIL_IGNORE == 0) | (m & RAIL > 0)]).float()
+        y = targets(m, self.classes)
         if self.augment:  # orthophotos: flips and 90-degree rotations keep geometry valid
             k = np.random.randint(4)
             x, y = torch.rot90(x, k, (1, 2)), torch.rot90(y, k, (1, 2))
@@ -120,68 +134,78 @@ def dice_loss(logits, y, valid, eps=1.0):
     return 1 - ((2 * inter + eps) / (p.sum((0, 2, 3)) + y.sum((0, 2, 3)) + eps)).mean()
 
 
-def train(epochs, batch, lr):
+def train(epochs, batch, lr, classes, out):
     dev = device()
-    model = build_model().to(dev)
-    tr = torch.utils.data.DataLoader(RoadData("train", True), batch_size=batch, shuffle=True,
+    n = len(classes)
+    model = build_model(n_classes=n).to(dev)
+    tr = torch.utils.data.DataLoader(RoadData("train", True, classes), batch_size=batch, shuffle=True,
                                      num_workers=4, persistent_workers=True)
-    va = torch.utils.data.DataLoader(RoadData("val", False), batch_size=batch, num_workers=2)
+    va = torch.utils.data.DataLoader(RoadData("val", False, classes), batch_size=batch, num_workers=2)
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
     sched = torch.optim.lr_scheduler.OneCycleLR(opt, lr, total_steps=epochs * len(tr), pct_start=0.1)
-    WEIGHTS.parent.mkdir(parents=True, exist_ok=True)
-    best, log = -1.0, WEIGHTS.parent / "log.csv"
-    cols = [f"val_{c}_{m}" for c in CLASSES for m in ("iou", "precision", "recall")]
+    out.parent.mkdir(parents=True, exist_ok=True)
+    best, log = -1.0, out.parent / "log.csv"
+    cols = [f"val_{c}_{m}" for c in classes for m in ("iou", "precision", "recall")]
     log.write_text(",".join(["epoch", "train_loss", *cols, "seconds"]) + "\n")
     for ep in range(1, epochs + 1):
         t0, tot = time.time(), 0.0
         model.train()
         for x, y in tr:
             x, y = x.to(dev), y.to(dev)
-            y, valid = y[:, :2], y[:, 2:]
-            out = model(x)
-            loss = (F.binary_cross_entropy_with_logits(out, y, weight=valid, reduction="sum") / valid.sum()
-                    + dice_loss(out, y, valid))
+            y, valid = y[:, :n], y[:, n:]
+            logits = model(x)
+            loss = (F.binary_cross_entropy_with_logits(logits, y, weight=valid, reduction="sum") / valid.sum()
+                    + dice_loss(logits, y, valid))
             opt.zero_grad()
             loss.backward()
             opt.step()
             sched.step()
             tot += loss.item()
         model.eval()
-        tp, fp, fn = (torch.zeros(len(CLASSES)) for _ in range(3))
+        tp, fp, fn = (torch.zeros(n) for _ in range(3))
         with torch.no_grad():
             for x, y in va:
                 p = torch.sigmoid(model(x.to(dev))).cpu() > THRESHOLD
-                y, valid = y[:, :2] > 0.5, y[:, 2:] > 0.5
+                y, valid = y[:, :n] > 0.5, y[:, n:] > 0.5
                 tp += (p & y & valid).sum((0, 2, 3))
                 fp += (p & ~y & valid).sum((0, 2, 3))
                 fn += (~p & y & valid).sum((0, 2, 3))
         iou, prec, rec = tp / (tp + fp + fn).clamp(min=1), tp / (tp + fp).clamp(min=1), tp / (tp + fn).clamp(min=1)
-        stats = [f"{v:.4f}" for c in range(len(CLASSES)) for v in (iou[c], prec[c], rec[c])]
+        stats = [f"{v:.4f}" for c in range(n) for v in (iou[c], prec[c], rec[c])]
         row = ",".join([str(ep), f"{tot / len(tr):.4f}", *stats, f"{time.time() - t0:.0f}"])
         with log.open("a") as fh:
             fh.write(row + "\n")
         print(row, flush=True)
-        # checkpoint rule, fixed before training: street IoU + railway IoU
+        # checkpoint rule, fixed before training: sum of the class IoUs
         if iou.sum() > best:
             best = float(iou.sum())
-            torch.save(model.state_dict(), WEIGHTS)
-    print(f"best val IoU sum {best:.4f} -> {WEIGHTS}")
+            torch.save({"classes": list(classes), "state_dict": model.state_dict()}, out)
+    print(f"best val IoU sum {best:.4f} -> {out}")
 
 
 def load(weights=WEIGHTS):
-    """Model in eval mode; its classes are CLASSES[:n] (a 1-class checkpoint is streets only)."""
-    sd = torch.load(weights, map_location="cpu")
-    m = build_model(pretrained=False, n_classes=sd["segmentation_head.0.weight"].shape[0])
+    """Model in eval mode with `.classes`. Older checkpoints are bare state dicts
+    whose classes are CLASSES[:n] (1 = streets only, 2 = streets + railways)."""
+    ck = torch.load(weights, map_location="cpu")
+    sd = ck.get("state_dict", ck)
+    n = sd["segmentation_head.0.weight"].shape[0]
+    m = build_model(pretrained=False, n_classes=n)
     m.load_state_dict(sd)
+    m.classes = tuple(ck.get("classes", CLASSES[:n]))
     return m.to(device()).eval()
+
+
+def channel(model, name):
+    assert name in model.classes, f"{name} not among model classes {model.classes}"
+    return model.classes.index(name)
 
 
 @torch.no_grad()
 def predict(model, small):
-    """Per-class probabilities (len(CLASSES), h, w) for an image at the training scale (0.4 m/px)."""
+    """Per-class probabilities (len(model.classes), h, w) for an image at the training scale (0.4 m/px)."""
     h, w = small.shape[:2]
     win = ds.IMGSZ
-    acc = torch.zeros((len(CLASSES), h, w))
+    acc = torch.zeros((len(model.classes), h, w))
     cnt = torch.zeros((h, w))
     # taper window edges so overlapping predictions blend without seams
     ramp = torch.minimum(torch.arange(win) + 1, win - torch.arange(win)).float().clamp(max=PRED_OVERLAP)
@@ -202,8 +226,12 @@ def main():
     ap.add_argument("--epochs", type=int, default=30)
     ap.add_argument("--batch", type=int, default=8)
     ap.add_argument("--lr", type=float, default=3e-4)
+    ap.add_argument("--classes", default="road,rail", help=f"comma-separated subset of {CLASSES}")
+    ap.add_argument("--out", type=Path, default=WEIGHTS)
     a = ap.parse_args()
-    make_masks() if a.cmd == "masks" else train(a.epochs, a.batch, a.lr)
+    classes = tuple(a.classes.split(","))
+    assert set(classes) <= set(CLASSES), classes
+    make_masks() if a.cmd == "masks" else train(a.epochs, a.batch, a.lr, classes, a.out)
 
 
 if __name__ == "__main__":

@@ -14,7 +14,7 @@ from PIL import Image
 from shapely.geometry import box
 
 import osm
-from locate import load_detections, locate, rasterize_roads
+from locate import load_detections, locate, rasterize_areas, rasterize_roads
 from tiles import OUT, splits, tile_origin, tile_path
 
 SUCCESS_M = 10
@@ -30,9 +30,10 @@ STREET_GROUPS = {
 def street_quality(tiles, layers, det_dir, tol_m=3):
     """Road-mask precision/recall vs OSM per street type, and the same for the
     railway mask (tol_m tolerance, 1 m grid). Predicted rail on abandoned or
-    disused lines is not counted as false."""
+    disused lines is not counted as false. Forest mask: area IoU per tile (1 m, no tolerance)."""
     from scipy.ndimage import binary_dilation
-    roads, rails = layers[0], layers[3]
+    roads, rails, forest = layers[0], layers[3], layers[4]
+    f_tp = f_fp = f_fn = 0
     gt_n, hit_n, pred_n, pred_ok = {k: 0 for k in STREET_GROUPS}, {k: 0 for k in STREET_GROUPS}, 0, 0
     rail_gt_n = rail_hit = rail_pred_n = rail_pred_ok = 0
     for tile in tiles:
@@ -50,6 +51,13 @@ def street_quality(tiles, layers, det_dir, tol_m=3):
             rail_hit += hit
             rail_pred_n += rp.sum()
             rail_pred_ok += (rp & ok).sum()
+        forest_path = det_dir / f"{tile}_forestmask.png"
+        if forest_path.exists():
+            fp_ = np.asarray(Image.open(forest_path)) > 127
+            gt = rasterize_areas(forest, area, 1.0) > 0.5
+            tp, fp, fn = (fp_ & gt).sum(), (fp_ & ~gt).sum(), (~fp_ & gt).sum()
+            print(f"  {tile}: forest OSM {gt.mean():4.0%} predicted {fp_.mean():4.0%}  IoU {tp / max(tp + fp + fn, 1):.2f}")
+            f_tp, f_fp, f_fn = f_tp + tp, f_fp + fp, f_fn + fn
         pred = np.asarray(Image.open(det_dir / f"{tile}_roadmask.png")) > 127
         near_pred = binary_dilation(pred, iterations=tol_m)
         gt_all = rasterize_roads(roads, area, 1.0) > 0.5
@@ -68,6 +76,9 @@ def street_quality(tiles, layers, det_dir, tol_m=3):
         print(f"railway mask vs OSM: precision {rail_pred_ok / max(rail_pred_n, 1):.2f}  "
               f"recall {rail_hit / max(rail_gt_n, 1):.2f}  ({rail_gt_n} OSM rail px, "
               f"{rail_pred_n} predicted, {rail_pred_n - rail_pred_ok} outside OSM rail)")
+    if f_tp + f_fp + f_fn:
+        print(f"forest mask vs OSM: IoU {f_tp / (f_tp + f_fp + f_fn):.2f}  precision {f_tp / max(f_tp + f_fp, 1):.2f}  "
+              f"recall {f_tp / max(f_tp + f_fn, 1):.2f}")
 
 
 def make_oracle(tile, layers, out_dir, degrade=False):
@@ -77,7 +88,7 @@ def make_oracle(tile, layers, out_dir, degrade=False):
     intersections, jitters intersections by 2 m, adds 30 % false intersections
     and speckle noise to the road mask.
     """
-    roads, inter, fac, rails = layers
+    roads, inter, fac, rails, forest = layers
     rails = rails[rails.active]
     rng = np.random.default_rng(int(tile.replace("_", "")))
     e0, n0, gsd = tile_origin(tile_path(tile))
@@ -97,6 +108,8 @@ def make_oracle(tile, layers, out_dir, degrade=False):
     if degrade:
         mask = np.clip(mask * (rng.random(mask.shape) > 0.2) + (rng.random(mask.shape) > 0.97), 0, 1)
         rail = np.clip(rail * (rng.random(rail.shape) > 0.2) + (rng.random(rail.shape) > 0.999), 0, 1)
+        forest = forest[rng.random(len(forest)) > 0.4]  # drawn last: earlier noise stays as before
+    wood = rasterize_areas(forest, area, 1.0)
     to_px = lambda x, y: [round((x - e0) / gsd, 1), round((n0 - y) / gsd, 1)]
     det = {"image": tile, "width": size, "height": size, "gsd": gsd, "roadmask_gsd": 1.0,
            "intersections": [{"center_px": to_px(x, y), "conf": 1.0} for x, y in pts],
@@ -107,6 +120,7 @@ def make_oracle(tile, layers, out_dir, degrade=False):
     (out_dir / f"{tile}.json").write_text(json.dumps(det))
     Image.fromarray((mask * 255).astype(np.uint8)).save(out_dir / f"{tile}_roadmask.png")
     Image.fromarray((rail * 255).astype(np.uint8)).save(out_dir / f"{tile}_railmask.png")
+    Image.fromarray((wood * 255).astype(np.uint8)).save(out_dir / f"{tile}_forestmask.png")
     return out_dir / f"{tile}.json"
 
 

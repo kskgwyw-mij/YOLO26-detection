@@ -6,6 +6,8 @@ matching layers in EPSG:25832:
   facilities     static objects mapped to DOTA class names (dota_class)
   railways       track centrelines (LineString, railway, width_m, active); fetched
                  with a separate query and cache so the street data stays unchanged
+  forest         landuse=forest / natural=wood polygons (ways and multipolygon
+                 relations, clearings as holes), dissolved; own query and cache
 
 Usage:
   uv run osm.py                      # fetch (cached) + build outputs/osm/rosenheim.gpkg
@@ -83,6 +85,19 @@ def rail_query(area):
     kinds = "|".join([*RAIL_WIDTH, *RAIL_INACTIVE])
     return f"""[out:json][timeout:300];
 way["railway"~"^({kinds})$"]({s:.6f},{w:.6f},{n:.6f},{e:.6f});
+out body geom;"""
+
+
+def forest_query(area):
+    s, w, n, e = to_wgs84_bbox(area)
+    bb = f"{s:.6f},{w:.6f},{n:.6f},{e:.6f}"
+    return f"""[out:json][timeout:300];
+(
+  way["landuse"="forest"]({bb});
+  way["natural"="wood"]({bb});
+  relation["landuse"="forest"]({bb});
+  relation["natural"="wood"]({bb});
+);
 out body geom;"""
 
 
@@ -215,15 +230,39 @@ def build_rails(raw):
     return gpd.GeoDataFrame(rows, geometry="geometry", crs=CRS)
 
 
+def build_forest(raw):
+    """Dissolved forest polygons. Relations: outer rings minus inner rings (clearings)."""
+    proj = Transformer.from_crs("EPSG:4326", CRS, always_xy=True).transform
+    ring = lambda geom: LineString([proj(p["lon"], p["lat"]) for p in geom])
+    polys = []
+    for el in raw["elements"]:
+        if el["type"] == "way":
+            pts = [proj(p["lon"], p["lat"]) for p in el.get("geometry", [])]
+            if len(pts) >= 4 and el["nodes"][0] == el["nodes"][-1]:
+                polys.append(Polygon(pts).buffer(0))
+        elif el["type"] == "relation":
+            rings = {"outer": [], "inner": []}
+            for m in el.get("members", []):
+                if m["type"] == "way" and len(m.get("geometry", [])) >= 2:
+                    rings["inner" if m.get("role") == "inner" else "outer"].append(ring(m["geometry"]))
+            outer = unary_union(list(polygonize(rings["outer"])))
+            if not outer.is_empty:
+                polys.append(outer.difference(unary_union(list(polygonize(rings["inner"])))).buffer(0))
+    merged = unary_union([p for p in polys if not p.is_empty])
+    parts = [p for p in getattr(merged, "geoms", [merged]) if p.geom_type == "Polygon" and p.area > 100]
+    return gpd.GeoDataFrame({"geometry": parts}, geometry="geometry", crs=CRS)
+
+
 def build_all(name="rosenheim", area=AREA, refresh=False):
-    """Fetch (cached) and write all four layers to outputs/osm/<name>.gpkg."""
+    """Fetch (cached) and write all layers to outputs/osm/<name>.gpkg."""
     roads, inter, fac = build(fetch(name, area, refresh))
     rails = build_rails(fetch(name, area, refresh, "rail", rail_query))
+    forest = build_forest(fetch(name, area, refresh, "forest", forest_query))
     gpkg = OUT / "osm" / f"{name}.gpkg"
     gpkg.unlink(missing_ok=True)
-    for layer, gdf in zip(LAYERS, (roads, inter, fac, rails)):
+    for layer, gdf in zip(LAYERS, (roads, inter, fac, rails, forest)):
         gdf.to_file(gpkg, layer=layer)
-    return roads, inter, fac, rails
+    return roads, inter, fac, rails, forest
 
 
 def _roundabouts(node_sets, node_xy):
@@ -261,7 +300,7 @@ def _intersections(neighbours, node_xy):
     return out
 
 
-LAYERS = ("roads", "intersections", "facilities", "railways")
+LAYERS = ("roads", "intersections", "facilities", "railways", "forest")
 
 
 def load_layers(name="rosenheim"):
@@ -272,7 +311,7 @@ def load_layers(name="rosenheim"):
 def overlay(tile, crops=((1000, 2200), (2600, 3600), (300, 300)), size=1500):
     """Gate A: draw OSM road polygons + intersection disks over full-res crops."""
     from PIL import Image, ImageDraw
-    roads, inter, fac, rails = load_layers()
+    roads, inter, fac, rails, forest = load_layers()
     e0, n0, gsd = tile_origin(tile_path(tile))
     img = load_rgb(tile_path(tile))
     to_px = lambda coords: [((x - e0) / gsd, (n0 - y) / gsd) for x, y in coords]
@@ -284,6 +323,9 @@ def overlay(tile, crops=((1000, 2200), (2600, 3600), (300, 300)), size=1500):
         for p in getattr(poly, "geoms", [poly]):
             d.polygon(to_px(p.exterior.coords), fill=(255, 0, 0, 70), outline=(255, 0, 0, 200))
         d.line(to_px(r.geometry.coords), fill=(255, 255, 0, 255), width=2)
+    for g in forest.geometry:
+        for r in [g.exterior, *g.interiors]:
+            d.line(to_px(r.coords), fill=(0, 255, 0, 255), width=5)
     for _, r in rails.iterrows():
         poly = r.geometry.buffer(r.width_m / 2, cap_style="flat")
         color = (0, 120, 255) if r.active else (255, 0, 255)
@@ -315,12 +357,13 @@ def main():
     if a.overlay:
         print(overlay(a.overlay))
         return
-    roads, inter, fac, rails = build_all(refresh=a.refresh)
+    roads, inter, fac, rails, forest = build_all(refresh=a.refresh)
     print(f"bbox S,W,N,E = {tuple(round(v, 5) for v in to_wgs84_bbox(AREA))}")
     print(f"roads {len(roads)}  ({roads.length.sum() / 1000:.0f} km)")
     print(f"intersections {len(inter)}  degree: {inter.degree.value_counts().sort_index().to_dict()}")
     print(f"facilities: {fac.dota_class.value_counts().to_dict()}")
     print(f"railways: {rails.length.groupby(rails.railway).sum().div(1000).round(1).to_dict()} km")
+    print(f"forest: {len(forest)} polygons, {forest.area.sum() / 1e6:.1f} km2, edge {forest.boundary.length.sum() / 1000:.0f} km")
 
 
 if __name__ == "__main__":

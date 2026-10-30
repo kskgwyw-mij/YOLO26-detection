@@ -6,6 +6,7 @@ Outputs per tile in outputs/det/:
   <tile>.json          image size, gsd, DOTA OBB objects, predicted intersections
   <tile>_roadmask.png  predicted road mask at ROADMASK_GSD m/px (0-255), U-Net by default
   <tile>_railmask.png  predicted railway mask, same grid (U-Net only)
+  <tile>_forestmask.png  predicted forest mask, same grid (U-Net only)
   <tile>_preview.jpg   overlay for a visual check
 
 Usage: uv run detect.py <tif-or-folder> [--seg runs/roads/weights/best.pt]
@@ -82,12 +83,13 @@ def run_obb(model, img, conf, scales=OBB_SCALES):
     return out
 
 
-def run_seg(model, img, conf, road_model=None, rail_model=None):
-    """Road mask, railway mask (None without `rail_model`) and intersection centres.
+def run_seg(model, img, conf, unets):
+    """Masks {"road", "rail", "forest"} at ROADMASK_GSD and intersection centres.
 
-    Streets come from channel 0 of the U-Net `road_model` when given, otherwise
-    from the union of YOLO26-seg road instances; railways from the "rail"
-    channel of `rail_model`. Intersections always come from YOLO26-seg.
+    `unets` maps a class to the U-Net whose channel of that name is used.
+    Streets fall back to the union of YOLO26-seg road instances when there is
+    no "road" U-Net; a missing "rail" or "forest" U-Net gives a None mask.
+    Intersections always come from YOLO26-seg.
     """
     h, w = img.shape[:2]
     sh, sw = int(h * ds.SCALE), int(w * ds.SCALE)
@@ -111,15 +113,14 @@ def run_seg(model, img, conf, road_model=None, rail_model=None):
                     pts.append(((c0 + x) / ds.SCALE, (r0 + y) / ds.SCALE))
                     pconf.append(float(c))
     inter = merge_points(np.array(pts).reshape(-1, 2), np.array(pconf), INTERSECTION_MERGE_M / GSD)
-    if road_model is not None:
-        mask = (roadseg.predict(road_model, small)[0] > roadseg.THRESHOLD).astype(np.uint8)
-    rail = None
-    if rail_model is not None:
-        prob = roadseg.predict(rail_model, small)[roadseg.CLASSES.index("rail")]
-        rail = (prob > roadseg.THRESHOLD).astype(np.uint8)
+    masks = {"road": mask, "rail": None, "forest": None}
+    for name, unet in unets.items():
+        if unet is not None:
+            prob = roadseg.predict(unet, small)[roadseg.channel(unet, name)]
+            masks[name] = (prob > roadseg.THRESHOLD).astype(np.uint8)
     size = (int(round(w * GSD / ROADMASK_GSD)), int(round(h * GSD / ROADMASK_GSD)))
     coarse = lambda m: np.asarray(Image.fromarray(m * 255).resize(size, Image.BOX))
-    return coarse(mask), None if rail is None else coarse(rail), inter
+    return {k: None if m is None else coarse(m) for k, m in masks.items()}, inter
 
 
 def merge_points(xy, conf, radius):
@@ -131,10 +132,14 @@ def merge_points(xy, conf, radius):
     return [{"center_px": np.round(xy[i], 1).tolist(), "conf": round(float(conf[i]), 3)} for i in kept]
 
 
-def preview(img, det, roadmask, railmask, path):
+PREVIEW_COLORS = {"forest": (0, 200, 0), "road": (255, 0, 0), "rail": (0, 90, 255)}
+
+
+def preview(img, det, masks, path):
     s = 0.25
     im = Image.fromarray(img).resize((int(img.shape[1] * s), int(img.shape[0] * s)))
-    for m, color in ((roadmask, (255, 0, 0)), (railmask, (0, 90, 255))):
+    for name, color in PREVIEW_COLORS.items():
+        m = masks.get(name)
         if m is not None:
             a = Image.fromarray(m).resize(im.size).point(lambda v: int(v * 0.45))
             im = Image.composite(Image.new("RGB", im.size, color), im, a)
@@ -158,6 +163,8 @@ def main():
     ap.add_argument("--unet", type=Path, default=roadseg.STREET_WEIGHTS, help="U-Net for streets")
     ap.add_argument("--rail-unet", type=Path, default=roadseg.WEIGHTS,
                     help="two-class U-Net for railways ('none' to skip)")
+    ap.add_argument("--forest-unet", type=Path, default=roadseg.FOREST_WEIGHTS,
+                    help="U-Net for forest ('none' to skip)")
     ap.add_argument("--obb-conf", type=float, default=0.3)
     ap.add_argument("--seg-conf", type=float, default=0.25)
     ap.add_argument("--out", type=Path, default=OUT / "det")
@@ -165,24 +172,25 @@ def main():
     tifs = sorted(a.src.glob("*.tif")) if a.src.is_dir() else [a.src]
     a.out.mkdir(parents=True, exist_ok=True)
     obb, seg = YOLO(a.obb), YOLO(a.seg)  # each model loaded once, reused for every tile
-    unet = roadseg.load(a.unet) if a.roads == "unet" else None
-    rail_unet = None if str(a.rail_unet) == "none" else roadseg.load(a.rail_unet)
+    opt = lambda p: None if str(p) == "none" else roadseg.load(p)
+    unets = {"road": roadseg.load(a.unet) if a.roads == "unet" else None,
+             "rail": opt(a.rail_unet), "forest": opt(a.forest_unet)}
     for tif in tifs:
         img = load_rgb(tif)
-        roadmask, railmask, inter = run_seg(seg, img, a.seg_conf, unet, rail_unet)
+        masks, inter = run_seg(seg, img, a.seg_conf, unets)
         det = {"image": tif.stem, "width": img.shape[1], "height": img.shape[0], "gsd": GSD,
                "roadmask_gsd": ROADMASK_GSD, "objects": run_obb(obb, img, a.obb_conf),
                "intersections": inter}
         (a.out / f"{tif.stem}.json").write_text(json.dumps(det))
-        Image.fromarray(roadmask).save(a.out / f"{tif.stem}_roadmask.png")
-        if railmask is not None:
-            Image.fromarray(railmask).save(a.out / f"{tif.stem}_railmask.png")
-        preview(img, det, roadmask, railmask, a.out / f"{tif.stem}_preview.jpg")
+        for name, m in masks.items():
+            if m is not None:
+                Image.fromarray(m).save(a.out / f"{tif.stem}_{name}mask.png")
+        preview(img, det, masks, a.out / f"{tif.stem}_preview.jpg")
         counts = {}
         for o in det["objects"]:
             counts[o["class"]] = counts.get(o["class"], 0) + 1
-        rail = f"  rail {railmask.mean() / 2.55:.2f}%" if railmask is not None else ""
-        print(f"{tif.stem}: road {roadmask.mean() / 2.55:.1f}%{rail}  intersections {len(inter)}  {counts}")
+        cover = "  ".join(f"{k} {m.mean() / 2.55:.2f}%" for k, m in masks.items() if m is not None)
+        print(f"{tif.stem}: {cover}  intersections {len(inter)}  {counts}")
 
 
 if __name__ == "__main__":
