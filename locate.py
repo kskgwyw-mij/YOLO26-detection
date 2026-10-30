@@ -4,7 +4,8 @@ Reads only detect.py output (pixel space) and OSM. Never opens GeoTIFF tags.
 
   (a) road correlation: NCC of the predicted road mask against rasterized OSM
       streets over the whole search area (FFT); the same for the railway mask
-      against OSM railways when the image has any
+      against OSM railways, and for a band around the predicted forest edges
+      against the band around OSM forest edges, when the image has any
   (b) votes: every (detected, OSM) intersection pair and same-class DOTA
       facility pair votes for an image upper-left corner
   (c) combined map -> best / runner-up peak -> local 1 m refinement ->
@@ -21,7 +22,7 @@ import numpy as np
 import requests
 from PIL import Image, ImageDraw
 from pyproj import Transformer
-from scipy.ndimage import gaussian_filter, maximum_filter
+from scipy.ndimage import binary_dilation, binary_erosion, binary_opening, gaussian_filter, maximum_filter
 from scipy.signal import fftconvolve
 from scipy.spatial import cKDTree
 from shapely.geometry import box
@@ -36,6 +37,11 @@ W_INTER, W_FAC = 0.5, 0.3  # weight of vote maps relative to road NCC (range ~[-
 # Set a priori (no val tile has a railway): a straight track barely fixes the
 # position along itself, so rails count less than streets.
 W_RAIL = 0.5
+# Forest, set a priori: only edges are matched (filled areas give broad peaks
+# that barely separate the best position from one 100-200 m away).
+W_FOREST = 0.5
+FOREST_EDGE_M = 5.0       # half-width of the band around forest edges
+FOREST_MIN_M = 4.0        # opening radius: drops single trees and hedges from the mask
 MIN_SIGNAL = 0.002        # mask coverage below this: the mask is treated as empty
 PEAK_SEPARATION_M = 100
 MATCH_RADIUS_M = 6
@@ -47,11 +53,19 @@ MIN_SCORE = 0.25
 _raster_cache = {}
 
 
-def search_raster(lines, area, res, name):
-    key = (name, tuple(area), res, len(lines))
+def search_raster(name, area, res, build):
+    """Blurred search-area raster, built once per (layer, area, resolution)."""
+    key = (name, tuple(area), res)
     if key not in _raster_cache:
-        _raster_cache[key] = gaussian_filter(rasterize_roads(lines, area, res), BLUR_M / res)
+        _raster_cache[key] = gaussian_filter(build(), BLUR_M / res)
     return _raster_cache[key]
+
+
+def edge_band(m, res=RES):
+    """Band of +-FOREST_EDGE_M around the edges of boolean mask m; raster borders are not edges."""
+    m = binary_opening(m, iterations=max(1, round(FOREST_MIN_M / res)))
+    r = max(1, round(FOREST_EDGE_M / res))
+    return (binary_dilation(m, iterations=r) & ~binary_erosion(m, iterations=r, border_value=1)).astype(np.float32)
 
 
 def rasterize_roads(roads, area, res):
@@ -62,6 +76,19 @@ def rasterize_roads(roads, area, res):
     for g, w in zip(sub.geometry, sub.width_m):
         px = [((x - e0) / res, (n1 - y) / res) for x, y in g.coords]
         d.line(px, fill=255, width=max(1, int(round(w / res))), joint="curve")
+    return np.asarray(im, np.float32) / 255
+
+
+def rasterize_areas(polys, area, res):
+    """Filled polygons with holes; polys must not overlap (osm.build_forest dissolves them)."""
+    e0, n0, e1, n1 = area
+    im = Image.new("L", (int(round((e1 - e0) / res)), int(round((n1 - n0) / res))), 0)
+    d = ImageDraw.Draw(im)
+    to_px = lambda ring: [((x - e0) / res, (n1 - y) / res) for x, y in ring.coords]
+    for g in polys.geometry.iloc[polys.sindex.query(box(*area))]:
+        d.polygon(to_px(g.exterior), fill=255)
+        for hole in g.interiors:
+            d.polygon(to_px(hole), fill=0)
     return np.asarray(im, np.float32) / 255
 
 
@@ -127,37 +154,49 @@ def osm_for(area):
     return osm.load_layers(name)
 
 
+MASKS = ("road", "rail", "forest")
+
+
 def load_detections(det_path):
-    """Detection JSON, road mask and railway mask (None when detect.py wrote none)."""
+    """Detection JSON and {road, rail, forest} masks (None when detect.py wrote none)."""
     det = json.loads(Path(det_path).read_text())
     read = lambda p: np.asarray(Image.open(p), np.float32) / 255 if p.exists() else None
     stem = Path(det_path).stem
-    return (det, read(Path(det_path).with_name(f"{stem}_roadmask.png")),
-            read(Path(det_path).with_name(f"{stem}_railmask.png")))
+    return det, {k: read(Path(det_path).with_name(f"{stem}_{k}mask.png")) for k in MASKS}
 
 
-def mask_ncc(lines, area, mask, mres, name):
-    """NCC of a predicted mask (at mres m/px) against rasterized OSM lines on the RES grid."""
-    R = search_raster(lines, area, RES, name)
+def to_grid(mask, mres):
+    """Average a mask at mres m/px down to the RES search grid."""
     f = int(round(RES / mres))
     th, tw = mask.shape[0] // f, mask.shape[1] // f
-    T = gaussian_filter(mask[:th * f, :tw * f].reshape(th, f, tw, f).mean((1, 3)), BLUR_M / RES)
+    return mask[:th * f, :tw * f].reshape(th, f, tw, f).mean((1, 3))
+
+
+def mask_ncc(R, T):
+    """NCC map of template T over search raster R (zeros when T is nearly empty) and T's coverage."""
     signal = float(T.mean())
-    if signal <= MIN_SIGNAL or len(lines) == 0:
-        return np.zeros((R.shape[0] - th + 1, R.shape[1] - tw + 1), np.float32), signal
+    if signal <= MIN_SIGNAL:
+        return np.zeros((R.shape[0] - T.shape[0] + 1, R.shape[1] - T.shape[1] + 1), np.float32), signal
     return ncc_map(R, T), signal
 
 
-def locate(det, mask, rail, area, layers):
-    roads, inter, fac, rails = layers
+def locate(det, masks, area, layers):
+    roads, inter, fac, rails, forest = layers
     gsd, mres = det["gsd"], det["roadmask_gsd"]
     ext_e, ext_n = det["width"] * gsd, det["height"] * gsd
+    blur = lambda m: gaussian_filter(m, BLUR_M / RES)
 
-    # (a) road and railway NCC on the coarse grid
-    N, road_signal = mask_ncc(roads, area, mask, mres, "roads")
+    # (a) road, railway and forest-edge NCC on the coarse grid
+    R = search_raster("roads", area, RES, lambda: rasterize_roads(roads, area, RES))
+    N, road_signal = mask_ncc(R, blur(to_grid(masks["road"], mres)))
     Nr, rail_signal = np.zeros_like(N), 0.0
-    if rail is not None:
-        Nr, rail_signal = mask_ncc(rails[rails.active], area, rail, mres, "rails")
+    if masks.get("rail") is not None:
+        R = search_raster("rails", area, RES, lambda: rasterize_roads(rails[rails.active], area, RES))
+        Nr, rail_signal = mask_ncc(R, blur(to_grid(masks["rail"], mres)))
+    Nf, forest_signal = np.zeros_like(N), 0.0
+    if masks.get("forest") is not None:
+        R = search_raster("forest", area, RES, lambda: edge_band(rasterize_areas(forest, area, RES) > 0.5))
+        Nf, forest_signal = mask_ncc(R, blur(edge_band(to_grid(masks["forest"], mres) > 0.5)))
 
     # (b) vote maps, offsets in metres from the image's upper-left corner (x east, y south)
     det_int = np.array([p["center_px"] for p in det["intersections"]]).reshape(-1, 2) * gsd
@@ -169,7 +208,7 @@ def locate(det, mask, rail, area, layers):
     Vf = vote_map(N.shape, area, RES, det_fac, [osm.DOTA_WEIGHT[o["class"]] for o in objs],
                   osm_fac, fac.dota_class.to_numpy(), [o["class"] for o in objs])
 
-    C = N + W_RAIL * Nr + W_INTER * Vi + W_FAC * Vf
+    C = N + W_RAIL * Nr + W_FOREST * Nf + W_INTER * Vi + W_FAC * Vf
     pk = peaks(C, RES)
     if not pk:
         return {"status": "not localizable", "reason": "no peak"}
@@ -179,7 +218,7 @@ def locate(det, mask, rail, area, layers):
     n = area[3] - best[0] * RES
 
     # (c) local refinement at mask resolution, then least squares on intersections
-    e, n = refine_roads(roads, mask, e, n, mres)
+    e, n = refine_roads(roads, masks["road"], e, n, mres)
     e, n, n_match, rms = refine_intersections(det_int, osm_int, e, n)
     n_fac = count_facility_matches(objs, det_fac, fac, e, n)
 
@@ -191,9 +230,10 @@ def locate(det, mask, rail, area, layers):
             "center_lat": round(lat, 6), "center_lon": round(lon, 6),
             "score": round(score, 3), "runner_up": round(float(second), 3), "margin": round(margin, 3),
             "road_ncc": round(float(N[best]), 3), "rail_ncc": round(float(Nr[best]), 3),
+            "forest_ncc": round(float(Nf[best]), 3),
             "inter_votes": round(float(Vi[best]), 3),
             "fac_votes": round(float(Vf[best]), 3), "road_signal": round(road_signal, 4),
-            "rail_signal": round(rail_signal, 4),
+            "rail_signal": round(rail_signal, 4), "forest_signal": round(forest_signal, 4),
             "n_det_intersections": len(det_int), "matched_intersections": n_match,
             "intersection_rms_m": rms, "matched_facilities": n_fac,
             "error_estimate_m": round(rms / np.sqrt(n_match), 2) if n_match >= 2 else None}
@@ -255,8 +295,8 @@ def main():
     a = ap.parse_args()
     area = (tuple(float(v) for v in a.search.split(",")) if a.search
             else place_area(a.place) if a.place else osm.AREA)
-    det, mask, rail = load_detections(a.det)
-    print(json.dumps({"image": det["image"], **locate(det, mask, rail, area, osm_for(area))}, indent=1))
+    det, masks = load_detections(a.det)
+    print(json.dumps({"image": det["image"], **locate(det, masks, area, osm_for(area))}, indent=1))
 
 
 if __name__ == "__main__":
