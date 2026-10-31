@@ -3,10 +3,14 @@
   uv run evaluate.py --oracle          # OSM-made "perfect detections": checks locator logic
   uv run evaluate.py                   # real detect.py output in outputs/det, test split
   uv run evaluate.py --split val
+  uv run evaluate.py --split val,test --scale 10   # search area 10x osm.AREA (same centre)
 """
 import argparse
 import csv
 import json
+import math
+import resource
+import time
 from pathlib import Path
 
 import numpy as np
@@ -14,7 +18,7 @@ from PIL import Image
 from shapely.geometry import box
 
 import osm
-from locate import load_detections, locate, rasterize_areas, rasterize_roads
+from locate import load_detections, locate, osm_for, rasterize_areas, rasterize_roads
 from tiles import OUT, splits, tile_origin, tile_path
 
 SUCCESS_M = 10
@@ -130,36 +134,50 @@ def make_oracle(tile, layers, out_dir, degrade=False):
     return out_dir / f"{tile}.json"
 
 
+def scaled_area(scale):
+    """osm.AREA grown `scale`-fold in area around its centre, snapped to the 1 km grid."""
+    e0, n0, e1, n1 = osm.AREA
+    ce, cn, k = (e0 + e1) / 2, (n0 + n1) / 2, math.sqrt(scale) / 2
+    return tuple(round(v / 1000) * 1000 for v in (ce - (e1 - e0) * k, cn - (n1 - n0) * k,
+                                                  ce + (e1 - e0) * k, cn + (n1 - n0) * k))
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--oracle", action="store_true")
     ap.add_argument("--degrade", action="store_true", help="oracle with simulated detector errors")
-    ap.add_argument("--split", default="test")
+    ap.add_argument("--split", default="test", help="split name(s), comma-separated")
+    ap.add_argument("--scale", type=float, default=1, help="search area = this many times osm.AREA")
     ap.add_argument("--quality", action="store_true", help="street-mask precision/recall per street type")
     ap.add_argument("--det-dir", type=Path, default=OUT / "det")
     a = ap.parse_args()
-    layers = osm.load_layers()
+    area = osm.AREA if a.scale == 1 else scaled_area(a.scale)
+    layers = osm.load_layers() if a.scale == 1 else osm_for(area)
+    tiles = [t for name in a.split.split(",") for t in splits()[name]]
     if a.quality:
-        street_quality(splits()[a.split], layers, a.det_dir)
+        street_quality(tiles, layers, a.det_dir)
         return
+    print(f"search area {area}: {(area[2] - area[0]) * (area[3] - area[1]) / 1e6:.0f} km2")
     mode = ("oracle_degraded" if a.degrade else "oracle") if a.oracle else "real"
     det_dir = a.det_dir if mode == "real" else OUT / mode
     rows = []
-    for tile in splits()[a.split]:
+    for tile in tiles:
+        t0 = time.time()
         path = make_oracle(tile, layers, det_dir, a.degrade) if a.oracle else det_dir / f"{tile}.json"
         if not path.exists():
             print(f"{tile}: no detections, run detect.py first")
             continue
-        res = locate(*load_detections(path), osm.AREA, layers)
+        res = locate(*load_detections(path), area, layers)
         e0, n0, _ = tile_origin(tile_path(tile))
         err = float(np.hypot(res["ul_e"] - e0, res["ul_n"] - n0)) if "ul_e" in res else None
         row = {"tile": tile, "true_e": e0, "true_n": n0, "error_m": None if err is None else round(err, 2),
-               **{k: v for k, v in res.items() if k not in ("center_lat", "center_lon")}}
+               **{k: v for k, v in res.items() if k not in ("center_lat", "center_lon")},
+               "seconds": round(time.time() - t0, 1)}
         rows.append(row)
         print(f"{tile}: {res['status']:16s} err {row['error_m']} m  score {res.get('score')} "
               f"margin {res.get('margin')}  inter {res.get('matched_intersections')}/"
-              f"{res.get('n_det_intersections')}  fac {res.get('matched_facilities')}")
-    name = f"eval_{mode}_{a.split}.csv"
+              f"{res.get('n_det_intersections')}  fac {res.get('matched_facilities')}  {row['seconds']} s")
+    name = f"eval_{mode}_{a.split.replace(',', '+')}{'' if a.scale == 1 else f'_x{a.scale:g}'}.csv"
     with open(OUT / name, "w", newline="") as fh:
         w = csv.DictWriter(fh, fieldnames=list(dict.fromkeys(k for r in rows for k in r)))
         w.writeheader()
@@ -172,6 +190,7 @@ def main():
           f"({100 * len(good) / max(len(rows), 1):.0f} %) | median error {np.median(errs) if errs else '-'} m")
     print(f"not localizable: {[r['tile'] for r in rows if r['status'] != 'ok']}")
     print(f"WRONG but confident: {wrong}")
+    print(f"peak memory {resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 2 ** 30:.1f} GB")
     print(OUT / name)
 
 

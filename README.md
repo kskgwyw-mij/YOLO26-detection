@@ -51,6 +51,7 @@ uv run detect.py rosenheim_area/       # all models -> outputs/det/<tile>.json +
 uv run locate.py outputs/det/32732_5306.json [--search minE,minN,maxE,maxN | --place Rosenheim]
 uv run evaluate.py --oracle [--degrade]  # locator check with OSM-made (degraded) detections
 uv run evaluate.py                     # real detections, test split
+uv run evaluate.py --split val,test --scale 20   # same, search area 20x larger (block-wise, ~4 min/tile)
 uv run evaluate.py --quality           # street-mask precision/recall vs OSM per street type
 ```
 
@@ -134,6 +135,21 @@ Buildings (default setup, last two rows). OSM has 18,615 dissolved footprints in
 - Building NCC at the true position is 0.65–0.92, even on rural tiles with 1 % building cover (val 32729_5301: 0.78, margin 0.25 → 0.61). The scattered farms in rural areas form a distinctive pattern.
 - Building mask vs OSM: test IoU 0.69 (precision 0.82, recall 0.81). The checkpoint (epoch 22 of 30) was chosen by val building IoU, so val is slightly optimistic; test is clean.
 
+Larger search areas: the 6 val and 12 test tiles (default setup, `outputs/det_building`) were located again in search areas 4×, 10× and 20× the default 108 km², grown around its centre (`evaluate.py --scale`). `locate.py` scans the area in 10 km blocks that overlap by the peak separation, so the result is exactly that of one big map. At 4× it matched a single-map run on 32732_5306 exactly, at 3.2 instead of 4.6 GB.
+
+| Search area | Within 10 m | Wrong but confident | Median error | Margin, median change vs 1× (worst) | Median time per tile | Peak memory |
+|---|---|---|---|---|---|---|
+| 1× (108 km², 9 × 12 km) | 18/18 | 0 | 0.55 m | – | ~12 s | – |
+| 4× (432 km²) | 18/18 | 0 | 0.55 m | −0.012 (−0.121) | ~30 s | 4.8 GB |
+| 10× (1,102 km², 29 × 38 km) | 18/18 | 0 | 0.55 m | −0.025 (−0.121) | 87 s | 3.5 GB |
+| 20× (2,214 km², 41 × 54 km) | 18/18 | 0 | 0.55 m | −0.035 (−0.334) | 234 s | 4.4 GB |
+
+- Every position is identical to 1× at all scales; only the runner-up can change.
+- Most margins barely move. New runner-ups appear 6–24 km away, in the added area, and score only slightly higher than the old ones. Runner-ups within 1 km (32732_5305 at 344 m, 32729_5300 at 802 m, 32731_5306 at 935 m) are the same at every scale.
+- Time grows faster than the area at 20×: the street, railway, forest and building rasters no longer fit the 6 GB raster cache, so blocks are rebuilt. The search covers every 2 m offset, with no coarse-to-fine step yet.
+- Weak spot: val tile 32728_5301 (forest, no buildings), margin 0.493 → 0.479 → 0.479 → **0.159**. At 20× its runner-up (ul 711494, 5294796, near Irschenberg, 18 km away) scores 0.635 almost entirely from facility votes. One false `helicopter` detection (confidence 0.30, weight 3.0) lands on two OSM helipads there, while street NCC at that spot is only 0.036. The tile is still placed correctly and well above `MIN_MARGIN`. Nothing was changed; possible a-priori fixes are to count facility votes only where streets also match, or to drop the aircraft classes (`helicopter`, `plane`) from voting.
+- The other drop at 20× is test tile 32732_5308, 1.041 → 0.879 (runner-up 20 km away).
+
 Street mask vs OSM on the 12 test tiles (3 m tolerance):
 
 | Streets | Share of street px | Recall, YOLO26-seg | Recall, U-Net |
@@ -154,4 +170,4 @@ Detector quality on test tile 32732_5306, measured against OSM:
 
 Caveats:
 - the confidence threshold (`MIN_MARGIN = 0.05`) was set a priori. With YOLO streets, margins of correct results ranged from 0.09 to 0.76, and those of rejected results from 0.002 to 0.04. With the default setup, correct margins are 1.15–1.67 on test and 0.49–1.71 on val (before buildings: 0.77–1.21 and 0.25–1.26; before forest edges: 0.61–1.11 and 0.08–1.04). The weakest, val tile 32729_5301 (rural, 0/1 intersections matched), was fragile at 0.082: one U-Net retrain moved it to 0.043, below the threshold, with its position still correct. Forest edges lift it to 0.25, buildings to 0.61.
-- larger search areas will lower the margins; they have not been tested yet.
+- larger search areas lower the margins only slightly up to 20× (2,214 km², see above), but a single false facility detection can create a competitor without any street support.
