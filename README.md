@@ -9,7 +9,7 @@ Proof of Concept: locate aerial images from their content alone, by matching YOL
    - buildings: a fourth U-Net with one output channel, trained on OSM building footprints (`building=*`, multipolygons with courtyards, underground ones dropped, footprints < 10 m² ignored). Here the **area** mask is matched: buildings are small, so the footprint pattern itself is the landmark.
    - intersections: `yolo26s-seg` fine-tuned on labels generated automatically from OSM
    - sports facilities, roundabouts, bridges, tanks: pretrained `yolo26s-obb` (DOTA-v1); vehicles are detected but never used for locating
-2. **Read** the same features for a coarse search area from a local OSM extract (Geofabrik `bayern-latest.osm.pbf`, read with pyosmium). The extract is a fixed snapshot: no rate limits or outages, and runs are reproducible. The Overpass API source used before is archived in `overpass.py` (with its caches in `outputs/osm/overpass/`), for areas outside the extract.
+2. **Read** the same features for a coarse search area from a local OSM snapshot: a PostGIS database loaded from the Geofabrik extract `bayern-latest.osm.pbf` (or, without the database, the extract itself via pyosmium; both give identical layers). A fixed snapshot means no rate limits or outages, and runs are reproducible. The Overpass API source used before is archived in `overpass.py` (with its caches in `outputs/osm/overpass/`), for areas outside the extract.
 3. **Locate**: correlate the predicted road mask with the rasterized OSM street network (FFT), plus the railway mask with OSM railways the forest-edge band with OSM forest edges and the building mask with OSM footprints (weights `W_RAIL = W_FOREST = W_BUILDING = 0.5`, set a priori) when the image has any, add votes from intersection and facility pairs, refine at 1 m, then least-squares on matched intersections. Ambiguous results are reported as *not localizable* instead of guessed.
 
 ## Assumptions for an image to locate
@@ -25,11 +25,20 @@ uv sync
 mkdir -p weights && cd weights && uv run python -c "from ultralytics import YOLO; YOLO('yolo26s-obb.pt'); YOLO('yolo26s-seg.pt')"
 curl -L --create-dirs -o outputs/osm/pbf/bayern-latest.osm.pbf https://download.geofabrik.de/europe/germany/bayern-latest.osm.pbf   # 860 MB
 ```
-The results below use the snapshot of 2026-10-29T21:21:26Z (md5 `2982bfa6058e35d97bce0211ec1b250b`). Geofabrik replaces `-latest` daily, so later downloads may differ slightly; `osm.py` prints the snapshot it read, and the caches `outputs/osm/<name>_<kind>.json` record it. Reading the search area takes about 2.5 min (three passes over the file, 2.2 GB RAM); a search area outside the cached one is read once and cached as well.
+The results below use the snapshot of 2026-10-29T21:21:26Z (md5 `2982bfa6058e35d97bce0211ec1b250b`). Geofabrik replaces `-latest` daily, so later downloads may differ slightly; `osm.py` prints the snapshot it read.
+
+Local PostGIS (macOS/Homebrew; local socket, no password, starts at login):
+```
+brew install postgresql@18 postgis osm2pgsql
+brew services start postgresql@18
+createdb osm && psql -d osm -c "create extension postgis"   # in /opt/homebrew/opt/postgresql@18/bin
+osm2pgsql -d osm -O flex -S osm_flex.lua outputs/osm/pbf/bayern-latest.osm.pbf   # ~6 min, 3.7 GB
+```
+`osm_flex.lua` imports only what `osm.SELECT` uses (streets, facilities, railways, forest, buildings) with raw tags, way node ids and assembled multipolygons. Reading the search area then takes under a second instead of 2.5 min, so any search area in Bavaria is cheap. Set `OSM_DSN` for another database. Without a reachable database `osm.py` falls back to the PBF (`--source pbf`: three passes over the file, 2.2 GB RAM, cached in `outputs/osm/<name>_<kind>.json`).
 
 ## Pipeline
 ```
-uv run osm.py                          # read the PBF (cached) -> outputs/osm/rosenheim.gpkg  [--refresh] [--pbf other.osm.pbf]
+uv run osm.py                          # read PostGIS -> outputs/osm/rosenheim.gpkg  [--source pbf [--refresh] [--pbf other.osm.pbf]]
 uv run osm.py --overlay 32732_5306     # check OSM vs. image alignment
 uv run make_dataset.py                 # OSM-labelled YOLO-seg dataset (train/val tiles only)
 uv run train.py --smoke                # 1-epoch pipeline check
