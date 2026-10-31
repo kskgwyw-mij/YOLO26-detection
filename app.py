@@ -325,7 +325,7 @@ def main():
             key, src = name, lambda: path
         gsd = st.number_input("Pixel size (m)", 0.05, 2.0, detect.GSD, 0.05, format="%.2f")
         bbox = st.text_input("Search area (minE,minN,maxE,maxN, EPSG:25832)", ",".join(map(str, osm.AREA)),
-                             help="Outside the cached Rosenheim area, OSM is first read from the Bavaria extract (about 2.5 min).")
+                             help="Outside the cached Rosenheim area, OSM is first read from the local PostGIS database (a few seconds).")
         area = tuple(float(v) for v in bbox.split(","))
         reuse = st.checkbox("Replay saved detections (outputs/det) instead of running the models",
                             help="Test and val tiles only; skips the ~40 s model run.")

@@ -1,6 +1,6 @@
-"""Read OSM features for the search area from a local Geofabrik .osm.pbf extract
-(pyosmium; Overpass is archived in overpass.py) and turn them into matching layers
-in EPSG:25832:
+"""Read OSM features for the search area from a local PostGIS database (loaded from
+the Geofabrik extract with osm_flex.lua) or straight from the .osm.pbf (pyosmium;
+Overpass is archived in overpass.py) and turn them into matching layers in EPSG:25832:
 
   roads          buffered-width street centrelines (LineString, highway, width_m)
   intersections  junction points where >= 3 street segments meet (degree)
@@ -11,20 +11,25 @@ in EPSG:25832:
   buildings      building=* footprints (ways and multipolygon relations, courtyards
                  as holes; underground ones dropped), dissolved
 
-The raw elements are cached per kind (SELECT) in outputs/osm/<name>_<kind>.json.
+Both sources give the same elements per kind (SELECT); PBF reads are cached in
+outputs/osm/<name>_<kind>.json, PostGIS answers in well under a second.
 
 Usage:
-  uv run osm.py                      # read PBF (cached) + build outputs/osm/rosenheim.gpkg
+  uv run osm.py                      # read PostGIS + build outputs/osm/rosenheim.gpkg
+  uv run osm.py --source pbf         # same from the .osm.pbf (cached), no database needed
   uv run osm.py --overlay 32732_5306 # Gate A: draw OSM labels over a tile
 """
 import argparse
 import json
+import os
 from pathlib import Path
 from collections import defaultdict
 
 import geopandas as gpd
 import numpy as np
 from pyproj import Transformer
+import shapely
+from shapely import from_wkb
 from shapely.geometry import LineString, MultiPoint, Point, Polygon, box
 from shapely.ops import polygonize, unary_union
 
@@ -34,6 +39,8 @@ from tiles import CRS, OUT, load_rgb, tile_origin, tile_path
 AREA = (727000, 5298000, 736000, 5310000)  # minE, minN, maxE, maxN
 # Geofabrik extract, read with pyosmium; snapshot date is in its header (pbf_info).
 PBF = OUT / "osm" / "pbf" / "bayern-latest.osm.pbf"
+# Local PostGIS with that extract imported (osm2pgsql -O flex -S osm_flex.lua); see README.
+DSN = os.environ.get("OSM_DSN", "dbname=osm")
 USER_AGENT = "YOLO26-detection-poc/0.1 (aerial geolocation research)"
 
 ROAD_WIDTH = {
@@ -179,14 +186,64 @@ def read_pbf(area, pbf=PBF):
             for k, els in out.items()}
 
 
-def fetch(name="rosenheim", area=AREA, refresh=False, pbf=PBF):
-    """{kind: elements} for the area, cached per kind in outputs/osm/<name>_<kind>.json."""
+def read_postgis(area, dsn=DSN):
+    """{kind: elements} like read_pbf, from the osm_flex.lua tables. Relations carry
+    their assembled multipolygon (`polygon_wkb`, WGS84) instead of member geometries,
+    since untagged member ways aren't in the database; relations osm2pgsql couldn't
+    assemble (no polygon) are left out."""
+    import psycopg
+    s, w, n, e = to_wgs84_bbox(area)
+    env = "ST_MakeEnvelope(%(w)s, %(s)s, %(e)s, %(n)s, 4326)"
+    bb = {"w": w, "s": s, "e": e, "n": n}
+    pt = lambda x, y: {"lat": round(y, 7), "lon": round(x, 7)}
+    out = {k: [] for k in SELECT}
+    with psycopg.connect(dsn) as con:
+        props = dict(con.execute("select property, value from osm2pgsql_properties"))
+        q = lambda sql: con.execute(sql.replace("{env}", env), bb)
+        for nid, kinds, tags, wkb in q("select node_id, kinds, tags, ST_AsBinary(geom) from osm_nodes "
+                                       "where ST_Intersects(geom, {env}) order by 1"):
+            g = from_wkb(wkb)
+            for k in kinds:
+                out[k].append({"type": "node", "id": nid, **pt(g.x, g.y), "tags": tags})
+        for wid, kinds, tags, nodes, wkb in q("select way_id, kinds, tags, nodes, ST_AsBinary(geom) from osm_ways "
+                                              "where ST_Intersects(geom, {env}) order by 1"):
+            el = {"type": "way", "id": wid, "nodes": nodes,
+                  "geometry": [pt(x, y) for x, y in from_wkb(wkb).coords], "tags": tags}
+            for k in kinds:
+                out[k].append(el)
+        for rid, kinds, tags, members, wkb in q(  # a member way touches the area = the rings do
+                "select relation_id, kinds, tags, members, ST_AsBinary(geom) from osm_relations "
+                "where geom is not null and ST_Intersects(ST_Boundary(geom), {env}) order by 1"):
+            el = {"type": "relation", "id": rid, "tags": tags, "polygon_wkb": wkb.hex(),
+                  "members": [{"type": MEMBER_TYPE[m["type"]], "ref": m["ref"], "role": m["role"]}
+                              for m in members]}
+            for k in kinds:
+                out[k].append(el)
+    meta = {"generator": "osm.read_postgis",
+            "source": {"database": dsn, "timestamp": props.get("replication_timestamp"),
+                       "style": Path(props.get("style", "")).name}}
+    return {k: {**meta, "elements": els} for k, els in out.items()}
+
+
+def fetch(name="rosenheim", area=AREA, refresh=False, source="postgis", pbf=PBF):
+    """{kind: elements} for the area from PostGIS, or from the PBF cached per kind
+    in outputs/osm/<name>_<kind>.json."""
+    if source == "postgis":
+        import psycopg
+        try:
+            return read_postgis(area)
+        except psycopg.OperationalError as e:
+            print(f"PostGIS not reachable ({str(e).strip().splitlines()[0]}); reading the PBF instead")
     cache = lambda kind: OUT / "osm" / f"{name}_{kind}.json"
     if refresh or not all(cache(k).exists() for k in SELECT):
         cache("raw").parent.mkdir(parents=True, exist_ok=True)
         for kind, data in read_pbf(area, pbf).items():
             cache(kind).write_text(json.dumps(data))
     return {k: json.loads(cache(k).read_text()) for k in SELECT}
+
+
+def _project_wkb(hexwkb, proj):
+    return shapely.transform(from_wkb(bytes.fromhex(hexwkb)), lambda xy: np.column_stack(proj(xy[:, 0], xy[:, 1])))
 
 
 def _geom(el, proj):
@@ -200,6 +257,9 @@ def _geom(el, proj):
         if len(pts) >= 4 and el["nodes"][0] == el["nodes"][-1]:
             return Polygon(pts)
         return LineString(pts)
+    if "polygon_wkb" in el:  # read_postgis; outer rings only, as below
+        g = _project_wkb(el["polygon_wkb"], proj)
+        return unary_union([Polygon(p.exterior) for p in getattr(g, "geoms", [g])])
     lines = [LineString([proj(p["lon"], p["lat"]) for p in m["geometry"]])
              for m in el.get("members", []) if m.get("role") in ("outer", "")
              and len(m.get("geometry", [])) >= 2]
@@ -310,6 +370,8 @@ def build_areas(raw, min_area, keep=lambda tags: True):
             pts = [proj(p["lon"], p["lat"]) for p in el.get("geometry", [])]
             if len(pts) >= 4 and el["nodes"][0] == el["nodes"][-1]:
                 polys.append(Polygon(pts).buffer(0))
+        elif "polygon_wkb" in el:  # read_postgis: already assembled with its holes
+            polys.append(_project_wkb(el["polygon_wkb"], proj).buffer(0))
         elif el["type"] == "relation":
             rings = {"outer": [], "inner": []}
             for m in el.get("members", []):
@@ -340,9 +402,11 @@ def build_buildings(raw):
     return build_areas(raw, BUILDING_MIN_M2, is_visible_building)
 
 
-def build_all(name="rosenheim", area=AREA, refresh=False, pbf=PBF):
-    """Read (cached) and write all layers to outputs/osm/<name>.gpkg."""
-    raw = fetch(name, area, refresh, pbf)
+def build_all(name="rosenheim", area=AREA, refresh=False, source="postgis", pbf=PBF):
+    """Read and write all layers to outputs/osm/<name>.gpkg."""
+    raw = fetch(name, area, refresh, source, pbf)
+    src = raw["raw"]["source"]
+    print(f"OSM snapshot {src['timestamp']} from {src.get('database') or src['file']}")
     roads, inter, fac = build(raw["raw"])
     layers = {"roads": roads, "intersections": inter, "facilities": fac,
               "railways": build_rails(raw["rail"]),
@@ -445,16 +509,15 @@ def overlay(tile, crops=((1000, 2200), (2600, 3600), (300, 300)), size=1500):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--refresh", action="store_true", help="re-read the PBF extract")
+    ap.add_argument("--source", choices=("postgis", "pbf"), default="postgis")
+    ap.add_argument("--refresh", action="store_true", help="re-read the PBF extract (--source pbf)")
     ap.add_argument("--pbf", type=Path, default=PBF, help="Geofabrik .osm.pbf extract")
     ap.add_argument("--overlay", metavar="TILE")
     a = ap.parse_args()
     if a.overlay:
         print(overlay(a.overlay))
         return
-    L = build_all(refresh=a.refresh, pbf=a.pbf)
-    src = json.loads((OUT / "osm" / "rosenheim_raw.json").read_text())["source"]
-    print(f"OSM snapshot {src['timestamp']} from {src['file']} (md5 {src['md5']})")
+    L = build_all(refresh=a.refresh, source=a.source, pbf=a.pbf)
     roads, inter, fac, rails, forest, bld = (L[k] for k in LAYERS)
     print(f"bbox S,W,N,E = {tuple(round(v, 5) for v in to_wgs84_bbox(AREA))}")
     print(f"roads {len(roads)}  ({roads.length.sum() / 1000:.0f} km)")
