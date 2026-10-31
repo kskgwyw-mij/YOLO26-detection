@@ -50,16 +50,30 @@ MATCH_RADIUS_M = 6
 REFINE_RADIUS_M = 30
 MIN_MARGIN = 0.05         # best - runner-up below this -> not localizable
 MIN_SCORE = 0.25
+# Large search areas are scanned block by block (bounded memory, same result as one map).
+BLOCK_M = 10000           # upper-left positions per block, each direction
+PAD_M = 50                # rasters and vote maps are built this much larger, so blur and
+                          # edge bands don't see block borders
+RASTER_CACHE_BYTES = 6e9
 
 
 _raster_cache = {}
 
 
+def padded(area, res):
+    p = round(PAD_M / res)
+    return p, (area[0] - p * res, area[1] - p * res, area[2] + p * res, area[3] + p * res)
+
+
 def search_raster(name, area, res, build):
-    """Blurred search-area raster, built once per (layer, area, resolution)."""
+    """Blurred raster of one OSM layer over area, built PAD_M larger; cached per
+    (layer, area, resolution) up to RASTER_CACHE_BYTES, oldest dropped first."""
     key = (name, tuple(area), res)
     if key not in _raster_cache:
-        _raster_cache[key] = gaussian_filter(build(), BLUR_M / res)
+        p, big = padded(area, res)
+        _raster_cache[key] = np.ascontiguousarray(gaussian_filter(build(big), BLUR_M / res)[p:-p, p:-p])
+        while sum(a.nbytes for a in _raster_cache.values()) > RASTER_CACHE_BYTES and len(_raster_cache) > 1:
+            _raster_cache.pop(next(iter(_raster_cache)))
     return _raster_cache[key]
 
 
@@ -126,9 +140,15 @@ def vote_map(shape, area, res, det_xy_m, det_w, osm_xy, osm_cls=None, det_cls=No
     return gaussian_filter(V, sig) * (2 * np.pi * sig ** 2) / max(sum(det_w), 1e-6)
 
 
-def peaks(C, res, k=5):
+def peaks(C, res, k=5, keep=None):
+    """Top-k local maxima (window +-PEAK_SEPARATION_M); keep=(i0, i1, j0, j1) limits them to a sub-window."""
     sep = int(PEAK_SEPARATION_M / res)
     loc = (C == maximum_filter(C, size=2 * sep + 1)) & np.isfinite(C)
+    if keep is not None:
+        i0, i1, j0, j1 = keep
+        inside = np.zeros_like(loc)
+        inside[i0:i1, j0:j1] = True
+        loc &= inside
     idx = np.argwhere(loc)
     order = np.argsort(-C[loc])[:k]
     return [tuple(idx[o]) for o in order]
@@ -189,59 +209,86 @@ def locate(det, masks, area, layers):
     ext_e, ext_n = det["width"] * gsd, det["height"] * gsd
     blur = lambda m: gaussian_filter(m, BLUR_M / RES)
 
-    # (a) road, railway and forest-edge NCC on the coarse grid
-    R = search_raster("roads", area, RES, lambda: rasterize_roads(roads, area, RES))
-    N, road_signal = mask_ncc(R, blur(to_grid(masks["road"], mres)))
-    Nr, rail_signal = np.zeros_like(N), 0.0
+    # templates on the coarse grid: road, railway, forest-edge band, building masks
+    T = {"road": blur(to_grid(masks["road"], mres))}
     if masks.get("rail") is not None:
-        R = search_raster("rails", area, RES, lambda: rasterize_roads(rails[rails.active], area, RES))
-        Nr, rail_signal = mask_ncc(R, blur(to_grid(masks["rail"], mres)))
-    Nf, forest_signal = np.zeros_like(N), 0.0
+        T["rail"] = blur(to_grid(masks["rail"], mres))
     if masks.get("forest") is not None:
-        R = search_raster("forest", area, RES, lambda: edge_band(rasterize_areas(forest, area, RES) > 0.5))
-        Nf, forest_signal = mask_ncc(R, blur(edge_band(to_grid(masks["forest"], mres) > 0.5)))
-    Nb, building_signal = np.zeros_like(N), 0.0
+        T["forest"] = blur(edge_band(to_grid(masks["forest"], mres) > 0.5))
     if masks.get("building") is not None:
-        R = search_raster("buildings", area, RES, lambda: rasterize_areas(layers["buildings"], area, RES))
-        Nb, building_signal = mask_ncc(R, blur(to_grid(masks["building"], mres)))
+        T["building"] = blur(to_grid(masks["building"], mres))
+    signal = {k: float(t.mean()) for k, t in T.items()}
 
-    # (b) vote maps, offsets in metres from the image's upper-left corner (x east, y south)
+    # offsets in metres from the image's upper-left corner (x east, y south)
     det_int = np.array([p["center_px"] for p in det["intersections"]]).reshape(-1, 2) * gsd
     osm_int = np.array([[g.x, g.y] for g in inter.geometry]).reshape(-1, 2)
-    Vi = vote_map(N.shape, area, RES, det_int, [1.0] * len(det_int), osm_int)
     objs = [o for o in det["objects"] if o["use_for_locate"] and o["class"] in osm.DOTA_WEIGHT]
     det_fac = np.array([o["center_px"] for o in objs]).reshape(-1, 2) * gsd
     osm_fac = np.array([[c.x, c.y] for c in fac.geometry.centroid]).reshape(-1, 2)
-    Vf = vote_map(N.shape, area, RES, det_fac, [osm.DOTA_WEIGHT[o["class"]] for o in objs],
-                  osm_fac, fac.dota_class.to_numpy(), [o["class"] for o in objs])
 
-    C = N + W_RAIL * Nr + W_FOREST * Nf + W_BUILDING * Nb + W_INTER * Vi + W_FAC * Vf
-    pk = peaks(C, RES)
-    if not pk:
+    def block_maps(blk):
+        """(a) mask NCC and (b) vote maps for the upper-left corners blk covers."""
+        R = search_raster("roads", blk, RES, lambda a: rasterize_roads(roads, a, RES))
+        M = {"road": mask_ncc(R, T["road"])[0]}
+        zeros = np.zeros_like(M["road"])
+        M["rail"] = (mask_ncc(search_raster("rails", blk, RES, lambda a: rasterize_roads(rails[rails.active], a, RES)),
+                              T["rail"])[0] if "rail" in T else zeros)
+        M["forest"] = (mask_ncc(search_raster("forest", blk, RES, lambda a: edge_band(rasterize_areas(forest, a, RES) > 0.5)),
+                                T["forest"])[0] if "forest" in T else zeros)
+        M["building"] = (mask_ncc(search_raster("buildings", blk, RES, lambda a: rasterize_areas(layers["buildings"], a, RES)),
+                                  T["building"])[0] if "building" in T else zeros)
+        p, big = padded(blk, RES)  # vote blur must not see the block border either
+        shape = (M["road"].shape[0] + 2 * p, M["road"].shape[1] + 2 * p)
+        M["inter"] = vote_map(shape, big, RES, det_int, [1.0] * len(det_int), osm_int)[p:-p, p:-p]
+        M["fac"] = vote_map(shape, big, RES, det_fac, [osm.DOTA_WEIGHT[o["class"]] for o in objs],
+                            osm_fac, fac.dota_class.to_numpy(), [o["class"] for o in objs])[p:-p, p:-p]
+        M["C"] = (M["road"] + W_RAIL * M["rail"] + W_FOREST * M["forest"] + W_BUILDING * M["building"]
+                  + W_INTER * M["inter"] + W_FAC * M["fac"])
+        return M
+
+    # upper-left corners on the global RES grid, scanned in blocks; each block reaches
+    # PEAK_SEPARATION_M into its neighbours so the local-maximum test is exact
+    th, tw = T["road"].shape
+    rows = int(round((area[3] - area[1]) / RES)) - th + 1
+    cols = int(round((area[2] - area[0]) / RES)) - tw + 1
+    step, sep = int(BLOCK_M / RES), int(PEAK_SEPARATION_M / RES)
+    cands = []  # (score, row, col, {map: value})
+    for r0 in range(0, rows, step):
+        for c0 in range(0, cols, step):
+            r1, c1 = min(r0 + step, rows), min(c0 + step, cols)
+            er0, er1, ec0, ec1 = max(r0 - sep, 0), min(r1 + sep, rows), max(c0 - sep, 0), min(c1 + sep, cols)
+            blk = (area[0] + ec0 * RES, area[3] - (er1 + th - 1) * RES,
+                   area[0] + (ec1 + tw - 1) * RES, area[3] - er0 * RES)
+            M = block_maps(blk)
+            for i, j in peaks(M["C"], RES, keep=(r0 - er0, r1 - er0, c0 - ec0, c1 - ec0)):
+                cands.append((float(M["C"][i, j]), er0 + i, ec0 + j, {k: float(m[i, j]) for k, m in M.items()}))
+    if not cands:
         return {"status": "not localizable", "reason": "no peak"}
-    best = pk[0]
-    second = C[pk[1]] if len(pk) > 1 else 0.0
-    e = area[0] + best[1] * RES
-    n = area[3] - best[0] * RES
+    cands.sort(key=lambda c: -c[0])
+    _, bi, bj, at = cands[0]
+    second = cands[1][0] if len(cands) > 1 else 0.0
+    e = area[0] + bj * RES
+    n = area[3] - bi * RES
+    runner_up_dist = (float(np.hypot((cands[1][2] - bj) * RES, (cands[1][1] - bi) * RES))
+                      if len(cands) > 1 else None)
 
     # (c) local refinement at mask resolution, then least squares on intersections
     e, n = refine_roads(roads, masks["road"], e, n, mres)
     e, n, n_match, rms = refine_intersections(det_int, osm_int, e, n)
     n_fac = count_facility_matches(objs, det_fac, fac, e, n)
 
-    score, margin = float(C[best]), float(C[best] - second)
+    score, margin = at["C"], at["C"] - second
     status = "ok" if (margin >= MIN_MARGIN and score >= MIN_SCORE) else "not localizable"
     to_wgs = Transformer.from_crs(CRS, "EPSG:4326", always_xy=True)
     lon, lat = to_wgs.transform(e + ext_e / 2, n - ext_n / 2)
     return {"status": status, "ul_e": round(e, 2), "ul_n": round(n, 2),
             "center_lat": round(lat, 6), "center_lon": round(lon, 6),
             "score": round(score, 3), "runner_up": round(float(second), 3), "margin": round(margin, 3),
-            "road_ncc": round(float(N[best]), 3), "rail_ncc": round(float(Nr[best]), 3),
-            "forest_ncc": round(float(Nf[best]), 3), "building_ncc": round(float(Nb[best]), 3),
-            "inter_votes": round(float(Vi[best]), 3),
-            "fac_votes": round(float(Vf[best]), 3), "road_signal": round(road_signal, 4),
-            "rail_signal": round(rail_signal, 4), "forest_signal": round(forest_signal, 4),
-            "building_signal": round(building_signal, 4),
+            "runner_up_dist_m": None if runner_up_dist is None else round(runner_up_dist),
+            "road_ncc": round(at["road"], 3), "rail_ncc": round(at["rail"], 3),
+            "forest_ncc": round(at["forest"], 3), "building_ncc": round(at["building"], 3),
+            "inter_votes": round(at["inter"], 3), "fac_votes": round(at["fac"], 3),
+            **{f"{k}_signal": round(signal.get(k, 0.0), 4) for k in ("road", "rail", "forest", "building")},
             "n_det_intersections": len(det_int), "matched_intersections": n_match,
             "intersection_rms_m": rms, "matched_facilities": n_fac,
             "error_estimate_m": round(rms / np.sqrt(n_match), 2) if n_match >= 2 else None}
