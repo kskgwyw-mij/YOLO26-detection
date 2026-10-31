@@ -1,4 +1,4 @@
-"""Semantic street / railway / forest segmentation (U-Net, ResNet34 encoder).
+"""Semantic street / railway / forest / building segmentation (U-Net, ResNet34 encoder).
 
 YOLO26-seg instance masks broke up long roads and missed dual carriageways,
 so streets come from this model; intersections still come from YOLO26-seg.
@@ -13,14 +13,15 @@ so the windows of RAIL_VAL_TILES move from train to val here (U-Net only;
 splits.json and the YOLO models are unchanged).
 
 detect.py takes streets from STREET_WEIGHTS, a streets-only U-Net trained with
-this file at commit f66b7e2, railways from WEIGHTS (road + rail) and forest from
-FOREST_WEIGHTS (forest only). In our one training run the street channel of the
+this file at commit f66b7e2, railways from WEIGHTS (road + rail), forest from
+FOREST_WEIGHTS (forest only) and buildings from BUILDING_WEIGHTS (buildings only). In our one training run the street channel of the
 two-class model was slightly weaker on the val tiles.
 
 Usage:
   uv run roadseg.py masks            # write datasets/roads/masks/{train,val}
   uv run roadseg.py train [--epochs 30]                                   # road + rail
   uv run roadseg.py train --classes forest --out runs/forestseg/best.pt   # forest
+  uv run roadseg.py train --classes building --out runs/buildingseg/best.pt
 """
 import argparse
 import time
@@ -42,12 +43,13 @@ DATA = ROOT / "datasets" / "roads"
 WEIGHTS = ROOT / "runs" / "roadseg" / "best.pt"
 STREET_WEIGHTS = ROOT / "runs" / "roadseg_streets" / "best.pt"
 FOREST_WEIGHTS = ROOT / "runs" / "forestseg" / "best.pt"
+BUILDING_WEIGHTS = ROOT / "runs" / "buildingseg" / "best.pt"
 MEAN = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
 STD = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
 PRED_OVERLAP = 160
 THRESHOLD = 0.5
-CLASSES = ("road", "rail", "forest")
-ROAD, RAIL, RAIL_IGNORE, FOREST = 1, 2, 4, 8   # bits of the saved mask PNG
+CLASSES = ("road", "rail", "forest", "building")
+ROAD, RAIL, RAIL_IGNORE, FOREST, BUILDING = 1, 2, 4, 8, 16   # bits of the saved mask PNG
 RAIL_VAL_TILES = ("32734_5304",)
 
 
@@ -64,7 +66,8 @@ def device():
 
 
 def make_masks():
-    roads, _, _, rails, forest = osm.load_layers()
+    L = osm.load_layers()
+    roads, rails, forest, buildings = L["roads"], L["railways"], L["forest"], L["buildings"]
     active, inactive = rails[rails.active], rails[~rails.active]
     res = ds.WIN * 0.2 / ds.IMGSZ
     origins = {}
@@ -83,7 +86,8 @@ def make_masks():
             m = ((rasterize_roads(roads, area, res) > 0.5) * ROAD
                  | (rasterize_roads(active, area, res) > 0.5) * RAIL
                  | (rasterize_roads(inactive, area, res) > 0.5) * RAIL_IGNORE
-                 | (rasterize_areas(forest, area, res) > 0.5) * FOREST)
+                 | (rasterize_areas(forest, area, res) > 0.5) * FOREST
+                 | (rasterize_areas(buildings, area, res) > 0.5) * BUILDING)
             Image.fromarray(m.astype(np.uint8)).save(out / f"{img.stem}.png")
         print(split, len(list(out.glob("*.png"))))
 
@@ -98,7 +102,7 @@ def image_list(split, hold_rail_val=True):
 
 def targets(m, classes):
     """Target and validity channels for `classes` from a bit-encoded mask (rail ignored on inactive lines)."""
-    bits = {"road": ROAD, "rail": RAIL, "forest": FOREST}
+    bits = {"road": ROAD, "rail": RAIL, "forest": FOREST, "building": BUILDING}
     y = [m & bits[c] > 0 for c in classes]
     valid = [(m & RAIL_IGNORE == 0) | (m & RAIL > 0) if c == "rail" else torch.ones_like(m, dtype=torch.bool)
              for c in classes]
@@ -201,8 +205,10 @@ def channel(model, name):
 
 
 @torch.no_grad()
-def predict(model, small):
-    """Per-class probabilities (len(model.classes), h, w) for an image at the training scale (0.4 m/px)."""
+def predict(model, small, on_window=None):
+    """Per-class probabilities (len(model.classes), h, w) for an image at the training scale (0.4 m/px).
+
+    on_window(r0, c0, win, prob_so_far) is called before each window, for live display."""
     h, w = small.shape[:2]
     win = ds.IMGSZ
     acc = torch.zeros((len(model.classes), h, w))
@@ -213,6 +219,8 @@ def predict(model, small):
     x_all = torch.from_numpy(np.ascontiguousarray(small)).permute(2, 0, 1).float() / 255
     for r0 in windows(h, win, PRED_OVERLAP):
         for c0 in windows(w, win, PRED_OVERLAP):
+            if on_window is not None:
+                on_window(r0, c0, win, (acc / cnt.clamp(min=1e-6)).numpy())
             x = ((x_all[:, r0:r0 + win, c0:c0 + win] - MEAN) / STD)[None].to(device())
             p = torch.sigmoid(model(x))[0].cpu()
             acc[:, r0:r0 + win, c0:c0 + win] += p * wgt
