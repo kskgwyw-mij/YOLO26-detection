@@ -5,7 +5,8 @@ Reads only detect.py output (pixel space) and OSM. Never opens GeoTIFF tags.
   (a) road correlation: NCC of the predicted road mask against rasterized OSM
       streets over the whole search area (FFT); the same for the railway mask
       against OSM railways, and for a band around the predicted forest edges
-      against the band around OSM forest edges, when the image has any
+      against the band around OSM forest edges, and for the building mask
+      against OSM building footprints, when the image has any
   (b) votes: every (detected, OSM) intersection pair and same-class DOTA
       facility pair votes for an image upper-left corner
   (c) combined map -> best / runner-up peak -> local 1 m refinement ->
@@ -42,6 +43,7 @@ W_RAIL = 0.5
 W_FOREST = 0.5
 FOREST_EDGE_M = 5.0       # half-width of the band around forest edges
 FOREST_MIN_M = 4.0        # opening radius: drops single trees and hedges from the mask
+W_BUILDING = 0.5          # building-footprint NCC, set a priori like W_RAIL / W_FOREST
 MIN_SIGNAL = 0.002        # mask coverage below this: the mask is treated as empty
 PEAK_SEPARATION_M = 100
 MATCH_RADIUS_M = 6
@@ -154,11 +156,11 @@ def osm_for(area):
     return osm.load_layers(name)
 
 
-MASKS = ("road", "rail", "forest")
+MASKS = ("road", "rail", "forest", "building")
 
 
 def load_detections(det_path):
-    """Detection JSON and {road, rail, forest} masks (None when detect.py wrote none)."""
+    """Detection JSON and {road, rail, forest, building} masks (None when detect.py wrote none)."""
     det = json.loads(Path(det_path).read_text())
     read = lambda p: np.asarray(Image.open(p), np.float32) / 255 if p.exists() else None
     stem = Path(det_path).stem
@@ -181,7 +183,8 @@ def mask_ncc(R, T):
 
 
 def locate(det, masks, area, layers):
-    roads, inter, fac, rails, forest = layers
+    roads, inter, fac, rails, forest = (layers[k] for k in ("roads", "intersections", "facilities",
+                                                             "railways", "forest"))
     gsd, mres = det["gsd"], det["roadmask_gsd"]
     ext_e, ext_n = det["width"] * gsd, det["height"] * gsd
     blur = lambda m: gaussian_filter(m, BLUR_M / RES)
@@ -197,6 +200,10 @@ def locate(det, masks, area, layers):
     if masks.get("forest") is not None:
         R = search_raster("forest", area, RES, lambda: edge_band(rasterize_areas(forest, area, RES) > 0.5))
         Nf, forest_signal = mask_ncc(R, blur(edge_band(to_grid(masks["forest"], mres) > 0.5)))
+    Nb, building_signal = np.zeros_like(N), 0.0
+    if masks.get("building") is not None:
+        R = search_raster("buildings", area, RES, lambda: rasterize_areas(layers["buildings"], area, RES))
+        Nb, building_signal = mask_ncc(R, blur(to_grid(masks["building"], mres)))
 
     # (b) vote maps, offsets in metres from the image's upper-left corner (x east, y south)
     det_int = np.array([p["center_px"] for p in det["intersections"]]).reshape(-1, 2) * gsd
@@ -208,7 +215,7 @@ def locate(det, masks, area, layers):
     Vf = vote_map(N.shape, area, RES, det_fac, [osm.DOTA_WEIGHT[o["class"]] for o in objs],
                   osm_fac, fac.dota_class.to_numpy(), [o["class"] for o in objs])
 
-    C = N + W_RAIL * Nr + W_FOREST * Nf + W_INTER * Vi + W_FAC * Vf
+    C = N + W_RAIL * Nr + W_FOREST * Nf + W_BUILDING * Nb + W_INTER * Vi + W_FAC * Vf
     pk = peaks(C, RES)
     if not pk:
         return {"status": "not localizable", "reason": "no peak"}
@@ -230,10 +237,11 @@ def locate(det, masks, area, layers):
             "center_lat": round(lat, 6), "center_lon": round(lon, 6),
             "score": round(score, 3), "runner_up": round(float(second), 3), "margin": round(margin, 3),
             "road_ncc": round(float(N[best]), 3), "rail_ncc": round(float(Nr[best]), 3),
-            "forest_ncc": round(float(Nf[best]), 3),
+            "forest_ncc": round(float(Nf[best]), 3), "building_ncc": round(float(Nb[best]), 3),
             "inter_votes": round(float(Vi[best]), 3),
             "fac_votes": round(float(Vf[best]), 3), "road_signal": round(road_signal, 4),
             "rail_signal": round(rail_signal, 4), "forest_signal": round(forest_signal, 4),
+            "building_signal": round(building_signal, 4),
             "n_det_intersections": len(det_int), "matched_intersections": n_match,
             "intersection_rms_m": rms, "matched_facilities": n_fac,
             "error_estimate_m": round(rms / np.sqrt(n_match), 2) if n_match >= 2 else None}

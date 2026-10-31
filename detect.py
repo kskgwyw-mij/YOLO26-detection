@@ -7,6 +7,7 @@ Outputs per tile in outputs/det/:
   <tile>_roadmask.png  predicted road mask at ROADMASK_GSD m/px (0-255), U-Net by default
   <tile>_railmask.png  predicted railway mask, same grid (U-Net only)
   <tile>_forestmask.png  predicted forest mask, same grid (U-Net only)
+  <tile>_buildingmask.png  predicted building mask, same grid (U-Net only)
   <tile>_preview.jpg   overlay for a visual check
 
 Usage: uv run detect.py <tif-or-folder> [--seg runs/roads/weights/best.pt]
@@ -49,7 +50,7 @@ def obb_nms(xywhr, conf, cls, iou=0.3):
     return np.array(keep, int)
 
 
-def run_obb(model, img, conf, scales=OBB_SCALES):
+def run_obb(model, img, conf, scales=OBB_SCALES, on_step=None):
     polys, xywhr, cf, cl = [], [], [], []
     for s in scales:
         im = img if s == 1 else np.asarray(Image.fromarray(img).resize(
@@ -57,6 +58,9 @@ def run_obb(model, img, conf, scales=OBB_SCALES):
         h, w = im.shape[:2]
         for r0 in windows(h, OBB_WIN, OBB_OVERLAP):
             for c0 in windows(w, OBB_WIN, OBB_OVERLAP):
+                if on_step is not None:  # boxes so far, before NMS
+                    on_step("facilities", window_px(r0, c0, OBB_WIN, s), {"boxes": [
+                        (p, model.names[int(c)]) for P, C in zip(polys, cl) for p, c in zip(P, C)]})
                 res = model.predict(im[r0:r0 + OBB_WIN, c0:c0 + OBB_WIN], imgsz=OBB_WIN,
                                     conf=conf, verbose=False)[0]
                 if res.obb is None or len(res.obb) == 0:
@@ -69,6 +73,9 @@ def run_obb(model, img, conf, scales=OBB_SCALES):
                 xywhr.append(b)
                 cf.append(res.obb.conf.cpu().numpy())
                 cl.append(res.obb.cls.cpu().numpy().astype(int))
+    if on_step is not None:  # stage finished (window None)
+        on_step("facilities", None, {"boxes": [
+            (p, model.names[int(c)]) for P, C in zip(polys, cl) for p, c in zip(P, C)]})
     if not polys:
         return []
     polys, xywhr, cf, cl = map(np.concatenate, (polys, xywhr, cf, cl))
@@ -83,13 +90,20 @@ def run_obb(model, img, conf, scales=OBB_SCALES):
     return out
 
 
-def run_seg(model, img, conf, unets):
-    """Masks {"road", "rail", "forest"} at ROADMASK_GSD and intersection centres.
+def window_px(r0, c0, win, scale):
+    """Window (x0, y0, x1, y1) in full-resolution pixels."""
+    return c0 / scale, r0 / scale, (c0 + win) / scale, (r0 + win) / scale
+
+
+def run_seg(model, img, conf, unets, on_step=None):
+    """Masks {"road", "rail", "forest", "building"} at ROADMASK_GSD and intersection centres.
 
     `unets` maps a class to the U-Net whose channel of that name is used.
     Streets fall back to the union of YOLO26-seg road instances when there is
-    no "road" U-Net; a missing "rail" or "forest" U-Net gives a None mask.
+    no "road" U-Net; any other class without a U-Net gives a None mask.
     Intersections always come from YOLO26-seg.
+    on_step(stage, window, partial) is called before each window, for live display,
+    and once more with window None when a stage is finished.
     """
     h, w = img.shape[:2]
     sh, sw = int(h * ds.SCALE), int(w * ds.SCALE)
@@ -99,6 +113,8 @@ def run_seg(model, img, conf, unets):
     pts, pconf = [], []
     for r0 in windows(sh, win, int(SEG_OVERLAP * ds.SCALE)):
         for c0 in windows(sw, win, int(SEG_OVERLAP * ds.SCALE)):
+            if on_step is not None:
+                on_step("intersections", window_px(r0, c0, win, ds.SCALE), {"points": list(pts)})
             res = model.predict(small[r0:r0 + win, c0:c0 + win], imgsz=win, conf=conf,
                                 retina_masks=True, verbose=False)[0]
             if res.boxes is None or len(res.boxes) == 0:
@@ -112,12 +128,19 @@ def run_seg(model, img, conf, unets):
                 if k == 1:
                     pts.append(((c0 + x) / ds.SCALE, (r0 + y) / ds.SCALE))
                     pconf.append(float(c))
+    if on_step is not None:
+        on_step("intersections", None, {"points": list(pts)})
     inter = merge_points(np.array(pts).reshape(-1, 2), np.array(pconf), INTERSECTION_MERGE_M / GSD)
-    masks = {"road": mask, "rail": None, "forest": None}
+    masks = {**dict.fromkeys(roadseg.CLASSES), "road": mask}
     for name, unet in unets.items():
         if unet is not None:
-            prob = roadseg.predict(unet, small)[roadseg.channel(unet, name)]
+            k = roadseg.channel(unet, name)
+            live = None if on_step is None else (lambda r0, c0, win, p, name=name, k=k: on_step(
+                name, window_px(r0, c0, win, ds.SCALE), {"mask": p[k] > roadseg.THRESHOLD}))
+            prob = roadseg.predict(unet, small, live)[k]
             masks[name] = (prob > roadseg.THRESHOLD).astype(np.uint8)
+            if on_step is not None:
+                on_step(name, None, {"mask": masks[name] > 0})
     size = (int(round(w * GSD / ROADMASK_GSD)), int(round(h * GSD / ROADMASK_GSD)))
     coarse = lambda m: np.asarray(Image.fromarray(m * 255).resize(size, Image.BOX))
     return {k: None if m is None else coarse(m) for k, m in masks.items()}, inter
@@ -132,10 +155,10 @@ def merge_points(xy, conf, radius):
     return [{"center_px": np.round(xy[i], 1).tolist(), "conf": round(float(conf[i]), 3)} for i in kept]
 
 
-PREVIEW_COLORS = {"forest": (0, 200, 0), "road": (255, 0, 0), "rail": (0, 90, 255)}
+PREVIEW_COLORS = {"forest": (0, 200, 0), "building": (255, 140, 0), "road": (255, 0, 0), "rail": (0, 90, 255)}
 
 
-def preview(img, det, masks, path):
+def preview(img, det, masks, path=None):
     s = 0.25
     im = Image.fromarray(img).resize((int(img.shape[1] * s), int(img.shape[0] * s)))
     for name, color in PREVIEW_COLORS.items():
@@ -150,7 +173,29 @@ def preview(img, det, masks, path):
     for p in det["intersections"]:
         x, y = p["center_px"][0] * s, p["center_px"][1] * s
         d.ellipse((x - 8, y - 8, x + 8, y + 8), outline=(0, 255, 255), width=3)
-    im.save(path, quality=85)
+    if path is not None:
+        im.save(path, quality=85)
+    return im
+
+
+def load_models(obb=ROOT / "weights" / "yolo26s-obb.pt", seg=ROOT / "runs" / "roads" / "weights" / "best.pt",
+                roads="unet", unet=roadseg.STREET_WEIGHTS, rail_unet=roadseg.WEIGHTS,
+                forest_unet=roadseg.FOREST_WEIGHTS, building_unet=roadseg.BUILDING_WEIGHTS):
+    """OBB model, seg model and the U-Nets per mask class ('none' skips rail / forest / building)."""
+    opt = lambda p: None if str(p) == "none" else roadseg.load(p)
+    unets = {"road": roadseg.load(unet) if roads == "unet" else None,
+             "rail": opt(rail_unet), "forest": opt(forest_unet), "building": opt(building_unet)}
+    return YOLO(str(obb)), YOLO(str(seg)), unets
+
+
+def detect(img, name, obb, seg, unets, obb_conf=0.3, seg_conf=0.25, on_step=None):
+    """Detection dict and {road, rail, forest, building} masks (uint8 0-255 at ROADMASK_GSD) for one image.
+    on_step(stage, window, partial) reports progress per window (see run_seg, run_obb)."""
+    masks, inter = run_seg(seg, img, seg_conf, unets, on_step)
+    det = {"image": name, "width": img.shape[1], "height": img.shape[0], "gsd": GSD,
+           "roadmask_gsd": ROADMASK_GSD, "objects": run_obb(obb, img, obb_conf, on_step=on_step),
+           "intersections": inter}
+    return det, masks
 
 
 def main():
@@ -165,22 +210,20 @@ def main():
                     help="two-class U-Net for railways ('none' to skip)")
     ap.add_argument("--forest-unet", type=Path, default=roadseg.FOREST_WEIGHTS,
                     help="U-Net for forest ('none' to skip)")
+    ap.add_argument("--building-unet", type=Path, default=roadseg.BUILDING_WEIGHTS,
+                    help="U-Net for buildings ('none' to skip)")
     ap.add_argument("--obb-conf", type=float, default=0.3)
     ap.add_argument("--seg-conf", type=float, default=0.25)
     ap.add_argument("--out", type=Path, default=OUT / "det")
     a = ap.parse_args()
     tifs = sorted(a.src.glob("*.tif")) if a.src.is_dir() else [a.src]
     a.out.mkdir(parents=True, exist_ok=True)
-    obb, seg = YOLO(a.obb), YOLO(a.seg)  # each model loaded once, reused for every tile
-    opt = lambda p: None if str(p) == "none" else roadseg.load(p)
-    unets = {"road": roadseg.load(a.unet) if a.roads == "unet" else None,
-             "rail": opt(a.rail_unet), "forest": opt(a.forest_unet)}
+    # each model loaded once, reused for every tile
+    obb, seg, unets = load_models(a.obb, a.seg, a.roads, a.unet, a.rail_unet, a.forest_unet, a.building_unet)
     for tif in tifs:
         img = load_rgb(tif)
-        masks, inter = run_seg(seg, img, a.seg_conf, unets)
-        det = {"image": tif.stem, "width": img.shape[1], "height": img.shape[0], "gsd": GSD,
-               "roadmask_gsd": ROADMASK_GSD, "objects": run_obb(obb, img, a.obb_conf),
-               "intersections": inter}
+        det, masks = detect(img, tif.stem, obb, seg, unets, a.obb_conf, a.seg_conf)
+        inter = det["intersections"]
         (a.out / f"{tif.stem}.json").write_text(json.dumps(det))
         for name, m in masks.items():
             if m is not None:
